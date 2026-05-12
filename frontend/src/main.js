@@ -15,6 +15,8 @@ let currentTemplateName = "";
 let selectedSessionCharacters = [];
 let selectedBackgroundName = "";
 let selectedBackgroundSpritePath = "";
+let selectedHistoryFile = "";
+let shouldResumeHistory = false;
 let didAutoLoadInitialTemplate = false;
 
 const MOCK_SESSION_NAMES = new Set(["雨夜古堡初遇"]);
@@ -423,6 +425,121 @@ function firstCharacter() {
 
 function firstBackground() {
   return normalizeBackgrounds(backendState)[0] || null;
+}
+
+function currentCastNames() {
+  return sanitizeSessionCharacterNames(
+    selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput()
+  );
+}
+
+function clearHistoryBinding() {
+  selectedHistoryFile = "";
+  shouldResumeHistory = false;
+  const roots = [$("#screen-sessions"), $("#screen-launch")].filter(Boolean);
+  for (const root of roots) {
+    ["历史文件", "历史记录", "历史路径", "会话历史"].forEach((label) => {
+      const input = findFieldControl(label, root);
+      if (input) input.value = "";
+    });
+  }
+}
+
+function markFreshSession(reason = "") {
+  clearHistoryBinding();
+  // 换角色/换场景后不再继续沿用 _temp 的旧角色、旧场景。
+  if (reason === "character" || reason === "background" || reason === "clear-history") {
+    currentTemplateName = "";
+  }
+  refreshAllDerivedState?.();
+}
+
+function collectUserPreferenceText() {
+  const roots = [$("#screen-sessions"), $("#screen-launch"), $("#screen-services")].filter(Boolean);
+  const labels = ["用户偏好", "用户喜好", "玩家偏好", "偏好", "User Preference", "User Preferences"];
+  for (const root of roots) {
+    for (const label of labels) {
+      const value = getField(label, root);
+      if (String(value || "").trim()) return String(value).trim();
+    }
+  }
+  return "";
+}
+
+function installSessionStateGuards() {
+  if (window.__shinsekaiSessionGuardsInstalled) return;
+  window.__shinsekaiSessionGuardsInstalled = true;
+
+  const originalLaunch = ShinsekaiAPI.launch;
+  ShinsekaiAPI.launch = (payload = {}) => {
+    const cast = currentCastNames();
+    const bg = selectedBackgroundName || getField("场景背景", $("#screen-sessions")) || payload.selected_bg || "";
+    return originalLaunch({
+      ...payload,
+      characters: cast,
+      character_names: cast,
+      selected_characters: cast,
+      selected_bg: bg,
+      bg_name: bg,
+      user_preference: collectUserPreferenceText(),
+      user_preferences: collectUserPreferenceText(),
+      // 只有用户明确点“继续/恢复/加载历史”时才带 history_file。
+      history_file: shouldResumeHistory ? (selectedHistoryFile || payload.history_file || "") : ""
+    });
+  };
+
+  const originalGenerateTemplate = ShinsekaiAPI.generateTemplate;
+  ShinsekaiAPI.generateTemplate = (payload = {}) => {
+    const cast = currentCastNames();
+    const bg = selectedBackgroundName || getField("场景背景", $("#screen-sessions")) || payload.bg_name || "";
+    return originalGenerateTemplate({
+      ...payload,
+      characters: cast,
+      character_names: cast,
+      selected_characters: cast,
+      bg_name: bg,
+      selected_bg: bg,
+      user_preference: collectUserPreferenceText(),
+      user_preferences: collectUserPreferenceText()
+    });
+  };
+
+  document.addEventListener("click", (event) => {
+    const btn = event.target.closest("button, .btn-action, .timeline-item, .char-card, .gallery-tile");
+    if (!btn) return;
+    const text = textOf(btn);
+
+    if (/清除历史|清空历史|新会话|新建会话|重新开始/.test(text)) {
+      setTimeout(() => markFreshSession("clear-history"), 0);
+      return;
+    }
+
+    if (/继续上次|恢复历史|加载历史|载入历史|打开历史/.test(text)) {
+      shouldResumeHistory = true;
+      const path = btn.dataset?.historyFile || btn.dataset?.path || "";
+      if (path) selectedHistoryFile = path;
+      return;
+    }
+
+    if (/加入会话|选择角色|设为出场|移除/.test(text) && btn.closest("#screen-characters, #screen-sessions")) {
+      setTimeout(() => markFreshSession("character"), 0);
+      return;
+    }
+
+    if (/替换场景|加入会话|使用场景|选择场景/.test(text) && btn.closest("#screen-scenes, #screen-sessions")) {
+      setTimeout(() => markFreshSession("background"), 0);
+    }
+  }, true);
+
+  document.addEventListener("change", (event) => {
+    const el = event.target;
+    if (!el || !el.closest) return;
+    const field = el.closest(".field");
+    const label = textOf($("label", field));
+    if (/出场角色|场景背景|角色|背景/.test(label)) {
+      markFreshSession(/场景|背景/.test(label) ? "background" : "character");
+    }
+  }, true);
 }
 
 function wireOriginalNavigation() {
@@ -2091,6 +2208,7 @@ async function hydrateFromBackend() {
 
 function boot() {
   ensureToggleInteractionStyle();
+  installSessionStateGuards();
   wireOriginalNavigation();
   wireOriginalToolModal();
   wireTogglesAsStateOnly();
