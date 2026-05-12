@@ -105,15 +105,17 @@ function looksLikeMockScenario(value) {
 
 
 
+
 function looksLikeGeneratedTemplateDump(value) {
   const text = String(value || "").replace(/\r\n/g, "\n").trim();
   if (!text) return false;
 
+  if (/template_gen\.[a-zA-Z0-9_]+/.test(text)) return true;
+
   const markers = [
-    "template_gen.",
     "template_gen.preamble",
     "template_gen.json_head_top",
-    "template_gen.json_speech_linet",
+    "template_gen.json_speech_line",
     "template_gen.profile_for",
     "template_gen.sprites_count",
     "template_gen.scene_count",
@@ -122,20 +124,21 @@ function looksLikeGeneratedTemplateDump(value) {
     "template_gen.closing",
     "json_head_top",
     "json_speech_line",
-    "profile_header",
     "sprites_header",
-    "requirements_header"
+    "profile_header",
+    "requirements_header",
+    "r_cot",
+    "r_format"
   ];
 
-  const hitCount = markers.reduce((n, marker) => n + (text.includes(marker) ? 1 : 0), 0);
-  if (hitCount >= 2) return true;
-  if (/template_gen\.[a-zA-Z0-9_]+/.test(text)) return true;
+  const hits = markers.filter((m) => text.includes(m)).length;
+  if (hits >= 2) return true;
 
-  // 系统模板常见结构：大量立绘/角色资料/场景/BGM/规则，不应进入“用户情景”
+  // 生成器系统模板常见形态：大量立绘 + 角色资料 + 场景/BGM/规则。
   if (
-    text.length > 1200 &&
+    text.length > 1000 &&
     /立绘\s*\d+[:：]/.test(text) &&
-    /(背景信息|性格特点|语言习惯|场景\s*\d+|音乐\s*\d+|requirements|r_cot|r_format)/.test(text)
+    /(背景信息|性格特点|语言习惯|场景\s*\d+|音乐\s*\d+|r_cot|r_format|requirements)/.test(text)
   ) {
     return true;
   }
@@ -145,27 +148,91 @@ function looksLikeGeneratedTemplateDump(value) {
 
 function cleanUserScenarioValue(value) {
   const text = String(value || "").replace(/\r\n/g, "\n").trim();
+  if (!text) return "";
   return looksLikeGeneratedTemplateDump(text) ? "" : text;
+}
+
+function normalizeTemplateBoundary(data) {
+  if (!data || typeof data !== "object") return data;
+
+  const out = { ...data };
+
+  const scenarioText = String(
+    out.scenario ??
+    out.user_scenario ??
+    out.userScenario ??
+    ""
+  ).replace(/\r\n/g, "\n").trim();
+
+  const systemText = String(
+    out.system_template ??
+    out.systemTemplate ??
+    out.template ??
+    out.content ??
+    out.text ??
+    ""
+  ).replace(/\r\n/g, "\n").trim();
+
+  // 关键修复：如果生成器系统模板被错误塞进用户情景，就转移回 system_template。
+  if (looksLikeGeneratedTemplateDump(scenarioText)) {
+    if (!systemText || !looksLikeGeneratedTemplateDump(systemText)) {
+      out.system_template = scenarioText;
+    }
+    out.scenario = "";
+    out.user_scenario = "";
+    out.userScenario = "";
+  } else {
+    out.scenario = cleanUserScenarioValue(scenarioText);
+    out.user_scenario = cleanUserScenarioValue(out.user_scenario);
+    out.userScenario = cleanUserScenarioValue(out.userScenario);
+  }
+
+  // 如果系统模板字段本身存在，绝不因为它长得像 template_gen 而清空。
+  if (!String(out.system_template || "").trim() && systemText) {
+    out.system_template = systemText;
+  }
+
+  return out;
+}
+
+function scenarioLabelMatches(label) {
+  const t = String(label || "").replace(/\s+/g, "");
+  return [
+    "用户情景",
+    "用户情境",
+    "用户场景",
+    "会话情景",
+    "会话情境",
+    "初始情景",
+    "初始场景",
+    "UserScenario"
+  ].includes(t);
+}
+
+function scrubVisibleScenarioFields() {
+  const roots = [document, $("#screen-sessions"), $("#screen-launch")].filter(Boolean);
+
+  for (const root of roots) {
+    $$(".field", root).forEach((field) => {
+      const label = textOf($("label", field));
+      if (!scenarioLabelMatches(label)) return;
+      const control = $("input, textarea, select", field);
+      if (!control) return;
+
+      if (looksLikeGeneratedTemplateDump(control.value)) {
+        control.value = "";
+      }
+    });
+  }
 }
 
 function installUserScenarioGuard() {
   if (window.__shinsekaiUserScenarioGuardInstalled) return;
   window.__shinsekaiUserScenarioGuardInstalled = true;
 
-  const scenarioLabels = new Set([
-    "用户情景",
-    "用户情境",
-    "用户场景",
-    "会话情景",
-    "会话情境",
-    "User Scenario"
-  ]);
-
-  const isScenarioLabel = (label) => scenarioLabels.has(String(label || "").trim());
-
   const originalSetField = setField;
   setField = function(labelText, value, root = document, index = 0) {
-    if (isScenarioLabel(labelText)) {
+    if (scenarioLabelMatches(labelText)) {
       value = cleanUserScenarioValue(value);
     }
     return originalSetField(labelText, value, root, index);
@@ -174,19 +241,32 @@ function installUserScenarioGuard() {
   const originalGetField = getField;
   getField = function(labelText, root = document, index = 0) {
     const value = originalGetField(labelText, root, index);
-    return isScenarioLabel(labelText) ? cleanUserScenarioValue(value) : value;
+    return scenarioLabelMatches(labelText) ? cleanUserScenarioValue(value) : value;
   };
 
-  function scrubVisibleScenarioFields() {
-    for (const root of [document, $("#screen-sessions"), $("#screen-launch")].filter(Boolean)) {
-      for (const label of scenarioLabels) {
-        const control = findFieldControl(label, root);
-        if (control && looksLikeGeneratedTemplateDump(control.value)) {
-          control.value = "";
-        }
-      }
-    }
-  }
+  const originalLoadTemplate = ShinsekaiAPI.loadTemplate;
+  ShinsekaiAPI.loadTemplate = async (...args) => {
+    const data = await originalLoadTemplate(...args);
+    return normalizeTemplateBoundary(data);
+  };
+
+  const originalSaveTemplate = ShinsekaiAPI.saveTemplate;
+  ShinsekaiAPI.saveTemplate = (payload = {}) => {
+    const normalized = normalizeTemplateBoundary(payload);
+    normalized.scenario = cleanUserScenarioValue(normalized.scenario || normalized.user_scenario || "");
+    normalized.user_scenario = normalized.scenario;
+    return originalSaveTemplate(normalized);
+  };
+
+  const originalGenerateTemplate = ShinsekaiAPI.generateTemplate;
+  ShinsekaiAPI.generateTemplate = async (payload = {}) => {
+    const data = await originalGenerateTemplate({
+      ...payload,
+      scenario: cleanUserScenarioValue(payload.scenario || payload.user_scenario || ""),
+      user_scenario: cleanUserScenarioValue(payload.user_scenario || payload.scenario || "")
+    });
+    return normalizeTemplateBoundary(data);
+  };
 
   const originalLaunch = ShinsekaiAPI.launch;
   ShinsekaiAPI.launch = (payload = {}) => {
@@ -203,19 +283,21 @@ function installUserScenarioGuard() {
     });
   };
 
-  const originalSaveTemplate = ShinsekaiAPI.saveTemplate;
-  ShinsekaiAPI.saveTemplate = (payload = {}) => {
-    const scenario = cleanUserScenarioValue(payload.scenario || payload.user_scenario || "");
-    return originalSaveTemplate({
-      ...payload,
-      scenario,
-      user_scenario: scenario
-    });
-  };
+  // 初始加载、模板加载、切页后都扫几次，防止旧 DOM mock 或异步 hydrate 又填回来。
+  [0, 100, 300, 800, 1500, 3000].forEach((delay) => {
+    setTimeout(scrubVisibleScenarioFields, delay);
+  });
 
-  setTimeout(scrubVisibleScenarioFields, 0);
-  setTimeout(scrubVisibleScenarioFields, 300);
+  document.addEventListener("input", (event) => {
+    const field = event.target?.closest?.(".field");
+    if (!field) return;
+    const label = textOf($("label", field));
+    if (scenarioLabelMatches(label) && looksLikeGeneratedTemplateDump(event.target.value)) {
+      event.target.value = "";
+    }
+  }, true);
 }
+
 
 function escapeHtml(value) {
   return String(value ?? "")
