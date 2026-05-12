@@ -692,8 +692,8 @@
         <div class="nav-item" data-target="sessions" vid="13">Sessions</div>
         <div class="nav-item" data-target="launch" vid="14">Launch</div>
     </nav>
-    <div class="user-meta" style="font-family: var(--font-serif); font-weight: bold;" vid="15">
-        v1.0.3 // 演出就绪
+    <div class="user-meta" data-modal="about" role="button" tabindex="0" title="About" style="font-family: var(--font-serif); font-weight: bold; cursor: pointer;" vid="15">
+        v1.0.3 // About
     </div>
 </header>
 
@@ -712,7 +712,7 @@
                     <div class="field"><label>供应商</label><select><option>Deepseek</option><option>ChatGPT</option><option>Gemini</option><option>Claude</option><option>豆包</option><option>通义千问</option></select></div>
                     <div class="field"><label>模型ID</label><input type="text" value="gpt-4-turbo-preview"></div>
                     <div class="field"><label>Base URL</label><input type="text" value="https://api.openai.com/v1"></div>
-                    <div class="field"><label>API Key</label><input type="password" value="sk-xxxxxxxxxxxxxxxx"></div>
+                    <div class="field"><label>API Key</label><input type="password" placeholder="YOUR_API_KEY_HERE"></div>
                     <div class="split-row">
                         <div class="field"><label>温度</label><input type="number" step="0.1" value="0.7"></div>
                         <div class="field"><label>流式输出</label><div class="toggle"></div></div>

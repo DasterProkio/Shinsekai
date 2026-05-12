@@ -446,6 +446,34 @@ function wireOriginalToolModal() {
   if (!modal || !title || !subtitle || !content) return;
 
   const data = {
+    about: {
+      title: "About",
+      subtitle: "致谢",
+      html: `
+        <div class="input-stack">
+          <div class="field">
+            <label>Original Project / Core Backend</label>
+            <p class="muted-line">
+              Shinsekai 原项目、核心后端实现与本地接口由
+              <a href="https://github.com/RachelForster" target="_blank" rel="noreferrer">不二咲爱笑 / RachelForster</a>
+              创作与维护。
+            </p>
+          </div>
+          <div class="field">
+            <label>WebView Frontend / UI Design</label>
+            <p class="muted-line">
+              <a href="https://github.com/DasterProkio" target="_blank" rel="noreferrer">DasterProkio</a>
+              基于原项目优化 WebUI、界面设计与前端接入体验。
+            </p>
+          </div>
+          <div class="field">
+            <label>Open Source</label>
+            <p class="muted-line">
+              感谢 PySide6 / Qt WebEngine、Vite，以及本项目使用到的各类开源依赖和社区贡献者。
+            </p>
+          </div>
+        </div>`
+    },
     portrait: {
       title: "生成肖像",
       subtitle: "基于角色设定、参考图和提示词批量生成立绘",
@@ -463,7 +491,7 @@ function wireOriginalToolModal() {
     }
   };
 
-  $$(".tool-icon").forEach((icon) => {
+  $$(".tool-icon, .user-meta[data-modal]").forEach((icon) => {
     icon.addEventListener("click", () => {
       const item = data[icon.dataset.modal];
       if (!item) return;

@@ -44,7 +44,7 @@ http://127.0.0.1:8765
 {
   "llm_provider": "OpenAI Compatible",
   "llm_model": "gpt-4-turbo-preview",
-  "api_key": "sk-...",
+  "api_key": "<your-api-key>",
   "base_url": "https://api.openai.com/v1",
   "is_streaming": "是",
   "temperature": 0.7,
