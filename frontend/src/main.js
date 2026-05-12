@@ -104,119 +104,6 @@ function looksLikeMockScenario(value) {
 }
 
 
-
-function looksLikeGeneratedTemplateDump(value) {
-  const text = String(value || "").replace(/\r\n/g, "\n").trim();
-  if (!text) return false;
-
-  const markers = [
-    "template_gen.",
-    "template_gen.preamble",
-    "template_gen.json_head_top",
-    "template_gen.json_speech_linet",
-    "template_gen.profile_for",
-    "template_gen.sprites_count",
-    "template_gen.scene_count",
-    "template_gen.bgm_count",
-    "template_gen.requirements_header",
-    "template_gen.closing",
-    "json_head_top",
-    "json_speech_line",
-    "profile_header",
-    "sprites_header",
-    "requirements_header"
-  ];
-
-  const hitCount = markers.reduce((n, marker) => n + (text.includes(marker) ? 1 : 0), 0);
-  if (hitCount >= 2) return true;
-  if (/template_gen\.[a-zA-Z0-9_]+/.test(text)) return true;
-
-  // 系统模板常见结构：大量立绘/角色资料/场景/BGM/规则，不应进入“用户情景”
-  if (
-    text.length > 1200 &&
-    /立绘\s*\d+[:：]/.test(text) &&
-    /(背景信息|性格特点|语言习惯|场景\s*\d+|音乐\s*\d+|requirements|r_cot|r_format)/.test(text)
-  ) {
-    return true;
-  }
-
-  return false;
-}
-
-function cleanUserScenarioValue(value) {
-  const text = String(value || "").replace(/\r\n/g, "\n").trim();
-  return looksLikeGeneratedTemplateDump(text) ? "" : text;
-}
-
-function installUserScenarioGuard() {
-  if (window.__shinsekaiUserScenarioGuardInstalled) return;
-  window.__shinsekaiUserScenarioGuardInstalled = true;
-
-  const scenarioLabels = new Set([
-    "用户情景",
-    "用户情境",
-    "用户场景",
-    "会话情景",
-    "会话情境",
-    "User Scenario"
-  ]);
-
-  const isScenarioLabel = (label) => scenarioLabels.has(String(label || "").trim());
-
-  const originalSetField = setField;
-  setField = function(labelText, value, root = document, index = 0) {
-    if (isScenarioLabel(labelText)) {
-      value = cleanUserScenarioValue(value);
-    }
-    return originalSetField(labelText, value, root, index);
-  };
-
-  const originalGetField = getField;
-  getField = function(labelText, root = document, index = 0) {
-    const value = originalGetField(labelText, root, index);
-    return isScenarioLabel(labelText) ? cleanUserScenarioValue(value) : value;
-  };
-
-  function scrubVisibleScenarioFields() {
-    for (const root of [document, $("#screen-sessions"), $("#screen-launch")].filter(Boolean)) {
-      for (const label of scenarioLabels) {
-        const control = findFieldControl(label, root);
-        if (control && looksLikeGeneratedTemplateDump(control.value)) {
-          control.value = "";
-        }
-      }
-    }
-  }
-
-  const originalLaunch = ShinsekaiAPI.launch;
-  ShinsekaiAPI.launch = (payload = {}) => {
-    const scenario = cleanUserScenarioValue(
-      payload.user_scenario ||
-      payload.scenario ||
-      getField("用户情景", $("#screen-sessions")) ||
-      ""
-    );
-    return originalLaunch({
-      ...payload,
-      user_scenario: scenario,
-      scenario
-    });
-  };
-
-  const originalSaveTemplate = ShinsekaiAPI.saveTemplate;
-  ShinsekaiAPI.saveTemplate = (payload = {}) => {
-    const scenario = cleanUserScenarioValue(payload.scenario || payload.user_scenario || "");
-    return originalSaveTemplate({
-      ...payload,
-      scenario,
-      user_scenario: scenario
-    });
-  };
-
-  setTimeout(scrubVisibleScenarioFields, 0);
-  setTimeout(scrubVisibleScenarioFields, 300);
-}
-
 function escapeHtml(value) {
   return String(value ?? "")
     .replaceAll("&", "&amp;")
@@ -2321,7 +2208,6 @@ async function hydrateFromBackend() {
 
 function boot() {
   ensureToggleInteractionStyle();
-  installUserScenarioGuard();
   installSessionStateGuards();
   wireOriginalNavigation();
   wireOriginalToolModal();
