@@ -10,18 +10,15 @@ const $ = (selector, root = document) => root.querySelector(selector);
 const $$ = (selector, root = document) => Array.from(root.querySelectorAll(selector));
 
 let backendState = null;
+let pluginCatalogState = { catalog: [], error: "", loaded: false, loading: false };
 let currentSystemTemplate = "";
 let currentTemplateName = "";
+let currentSystemTemplateKey = "";
 let selectedSessionCharacters = [];
 let selectedBackgroundName = "";
 let selectedBackgroundSpritePath = "";
-let selectedHistoryFile = "";
-let shouldResumeHistory = false;
-let didAutoLoadInitialTemplate = false;
-
-const MOCK_SESSION_NAMES = new Set(["雨夜古堡初遇"]);
-const MOCK_SCENARIOS = new Set(["用户在暴雨夜进入古堡书房，发现两位角色正在争论一份被火烧过的档案。"]);
-const MOCK_CHARACTER_NAMES = new Set(["艾莉诺·万斯", "阿里斯·索恩博士"]);
+let templateAutoGenerateTimer = null;
+let sessionCastTouched = false;
 
 const SESSION_RULES = [
   {
@@ -93,14 +90,42 @@ function templateDisplayName(name) {
     .trim();
 }
 
-function looksLikeMockSessionName(value) {
-  const v = String(value || "").trim();
-  return !v || MOCK_SESSION_NAMES.has(v);
+const TEMPLATE_SCENARIO_MARK = "<<<EASYAI_USER_SCENARIO>>>";
+const TEMPLATE_SYSTEM_MARK = "<<<EASYAI_SYSTEM_TEMPLATE>>>";
+
+async function loadRawTemplateText(name) {
+  try {
+    const path = `data/character_templates/${String(name || "").replace(/^\/+/, "")}`;
+    const response = await fetch(`${getApiBase()}/api/assets?path=${encodeURIComponent(path)}`);
+    if (!response.ok) return "";
+    return await response.text();
+  } catch {
+    return "";
+  }
 }
 
-function looksLikeMockScenario(value) {
+function hasStoredTemplateMarks(raw) {
+  return String(raw || "").includes(TEMPLATE_SCENARIO_MARK)
+    && String(raw || "").includes(TEMPLATE_SYSTEM_MARK);
+}
+
+function normalizeLoadedTemplate(res, raw = "") {
+  const scenario = String(res?.scenario || "").trim();
+  const system = String(res?.system_template || "").trim();
+  if (system || !scenario || scenario.startsWith("加载失败") || hasStoredTemplateMarks(raw)) {
+    return { scenario, system, legacyCombined: false };
+  }
+  return { scenario: "", system: scenario, legacyCombined: true };
+}
+
+function isBlankSessionName(value) {
   const v = String(value || "").trim();
-  return !v || MOCK_SCENARIOS.has(v);
+  return !v;
+}
+
+function isBlankScenario(value) {
+  const v = String(value || "").trim();
+  return !v;
 }
 
 
@@ -174,24 +199,36 @@ function realCharacterNameSet() {
   return new Set(normalizeCharacters(backendState).map((c) => c.name).filter(Boolean));
 }
 
+function toNameList(names) {
+  if (Array.isArray(names)) return names;
+  if (typeof names === "string") return names.split(/[,，、\n]/);
+  return [];
+}
+
 function sanitizeSessionCharacterNames(names, { allowUnknown = false } = {}) {
   const realNames = realCharacterNameSet();
-  return Array.from(new Set((names || [])
+  return Array.from(new Set(toNameList(names)
     .map((x) => String(x || "").trim())
     .filter(Boolean)
-    .filter((name) => !MOCK_CHARACTER_NAMES.has(name) || realNames.has(name))
     .filter((name) => allowUnknown || !realNames.size || realNames.has(name))));
 }
 
 function selectedCharactersFromInput() {
   const raw = getField("出场角色", $("#screen-sessions"));
-  return sanitizeSessionCharacterNames(raw.split(","));
+  return sanitizeSessionCharacterNames(raw);
 }
 
 function syncSelectedCharactersInput() {
   const root = $("#screen-sessions");
   const input = findFieldControl("出场角色", root);
   if (input) input.value = selectedSessionCharacters.join(", ");
+}
+
+function setSelectedSessionCharacters(names, { mirrorInput = false } = {}) {
+  sessionCastTouched = true;
+  selectedSessionCharacters = sanitizeSessionCharacterNames(names);
+  if (mirrorInput) syncSelectedCharactersInput();
+  return selectedSessionCharacters;
 }
 
 function currentBackground() {
@@ -206,7 +243,7 @@ function currentBackgroundSpritePath() {
 }
 
 function currentLeadCharacter() {
-  const name = selectedSessionCharacters[0] || selectedCharactersFromInput()[0];
+  const name = currentCastNames()[0];
   return normalizeCharacters(backendState).find((c) => c.name === name) || null;
 }
 
@@ -233,14 +270,58 @@ function ensureToggleInteractionStyle() {
     .char-intro-text { white-space: pre-line; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 4; -webkit-box-orient: vertical; }
     .template-preview-block { white-space: pre-wrap; max-height: 180px; overflow: auto; border-top: 1px solid var(--divider-subtle); margin-top: 10px; padding-top: 10px; }
     .launch-monitor-line { white-space: pre-line; }
+    .about-card { display: grid; gap: 16px; padding: 4px 0; }
+    .about-hero { border: var(--border-thin); background: var(--accent-blue); padding: 22px; }
+    .about-kicker { font-size: 10px; text-transform: uppercase; letter-spacing: 0; margin-bottom: 8px; color: var(--ink-muted); }
+    .about-title { font-family: var(--font-serif); font-size: 28px; line-height: 1.05; margin: 0 0 8px; }
+    .about-copy { color: var(--ink-muted); font-size: 13px; line-height: 1.7; }
+    .about-credits { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .about-credit { border: var(--border-thin); background: var(--surface); padding: 16px; }
+    .about-credit h3 { font-size: 13px; margin: 0 0 8px; }
+    .about-credit a { color: inherit; text-decoration: underline; text-underline-offset: 3px; }
+    @media (max-width: 720px) { .about-credits { grid-template-columns: 1fr; } }
     .stage-figure.has-image { background-color: transparent !important; border: none !important; border-radius: 0 !important; box-shadow: none !important; width: min(34vw, 360px); height: min(68%, 560px); bottom: 116px; z-index: 1; }
     .stage-preview .dialogue-box { position: relative; z-index: 3; }
+    [data-llm-thinking-row] { cursor: pointer; }
+    [data-llm-thinking-row].is-disabled { opacity: 0.45; cursor: not-allowed; }
+    [data-llm-thinking-row].is-disabled .toggle { pointer-events: none; }
+    [data-llm-thinking-help] { margin-top: -6px; }
   `;
   document.head.appendChild(style);
 }
 
 function getToggleState(toggle) {
   return toggle?.dataset.on !== "false";
+}
+
+function isTruthyValue(value) {
+  if (typeof value === "boolean") return value;
+  if (value === null || value === undefined) return false;
+  return ["1", "true", "yes", "on", "是", "启用", "enabled"].includes(String(value).trim().toLowerCase());
+}
+
+function findApiToggle(name, root = $("#screen-services")) {
+  return root?.querySelector(`[data-api-toggle="${CSS.escape(name)}"]`) || null;
+}
+
+function getApiToggleState(name, fallback = false) {
+  const toggle = findApiToggle(name);
+  return toggle ? getToggleState(toggle) : fallback;
+}
+
+function setApiToggleState(name, on) {
+  setToggleState(findApiToggle(name), on);
+}
+
+function mapValueForProvider(map, provider, fallback = undefined) {
+  if (!map || typeof map !== "object") return fallback;
+  const canonical = normalizeLlmProviderValue(provider);
+  const keys = [provider, canonical];
+  const direct = keys.find((key) => key && map[key] !== undefined && map[key] !== null);
+  if (direct) return map[direct];
+  const lowered = Object.fromEntries(Object.entries(map).map(([k, v]) => [String(k).toLowerCase(), v]));
+  const loweredKey = keys.map((key) => String(key || "").toLowerCase()).find((key) => lowered[key] !== undefined && lowered[key] !== null);
+  return loweredKey ? lowered[loweredKey] : fallback;
 }
 
 function findButton(label, root = document) {
@@ -301,6 +382,54 @@ function notify(message) {
 
 function yesNoFromToggle(toggle) {
   return getToggleState(toggle) ? "是" : "否";
+}
+
+function llmProviderSupportsThinking(provider) {
+  return normalizeLlmProviderValue(provider).toLowerCase() === "deepseek";
+}
+
+function currentLlmExtraConfig(provider) {
+  const extras = backendState?.api_config?.llm_extra_configs || {};
+  return mapValueForProvider(extras, provider, {}) || {};
+}
+
+function syncLlmThinkingUi(provider = getField("供应商", $("#screen-services")), { preserveToggleState = false } = {}) {
+  const services = $("#screen-services");
+  const toggle = findApiToggle("thinking", services);
+  if (!toggle) return;
+  const canonical = normalizeLlmProviderValue(provider);
+  const supported = llmProviderSupportsThinking(canonical);
+  const extra = currentLlmExtraConfig(canonical);
+  const enabled = supported && (preserveToggleState ? getToggleState(toggle) : isTruthyValue(extra.thinking_enabled));
+  setToggleState(toggle, enabled);
+  toggle.dataset.locked = supported ? "false" : "true";
+  toggle.setAttribute("aria-disabled", supported ? "false" : "true");
+  const row = services?.querySelector("[data-llm-thinking-row]");
+  row?.classList.toggle("is-disabled", !supported);
+  const label = row?.querySelector("span");
+  if (label) label.textContent = `模型思考模式${enabled ? "：已开启" : "：已关闭"}`;
+  const help = services?.querySelector("[data-llm-thinking-help]");
+  if (help) {
+    help.textContent = supported
+      ? "DeepSeek 支持 thinking_enabled；开启后会禁用不兼容的采样参数，并保留 reasoning_effort。"
+      : "当前供应商没有声明思考模式扩展参数；切换到 Deepseek 后可使用。";
+  }
+}
+
+function collectLlmExtraConfigs(provider) {
+  const api = backendState?.api_config || {};
+  const existing = api.llm_extra_configs && typeof api.llm_extra_configs === "object"
+    ? JSON.parse(JSON.stringify(api.llm_extra_configs))
+    : {};
+  const canonical = normalizeLlmProviderValue(provider);
+  if (!llmProviderSupportsThinking(canonical)) return existing;
+  const current = currentLlmExtraConfig(canonical);
+  existing[canonical] = {
+    ...current,
+    thinking_enabled: getApiToggleState("thinking", false),
+    reasoning_effort: current.reasoning_effort || "high"
+  };
+  return existing;
 }
 
 function formatCount(label, count) {
@@ -397,6 +526,7 @@ function applyLlmProviderFields(provider, { preserveCustomBase = false } = {}) {
   const savedBase = api.llm_base_url || api.base_url || "";
   const base = savedBase || row?.base_url || currentBase;
   if (!preserveCustomBase || !currentBase) setField("Base URL", base, services);
+  syncLlmThinkingUi(canonical);
 }
 
 function setupLlmProviderSelect(state = backendState) {
@@ -428,30 +558,81 @@ function firstBackground() {
 }
 
 function currentCastNames() {
-  return sanitizeSessionCharacterNames(
-    selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput()
-  );
+  if (!selectedSessionCharacters.length) {
+    selectedSessionCharacters = selectedCharactersFromInput();
+  } else {
+    selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters);
+  }
+  return selectedSessionCharacters.slice();
 }
 
 function clearHistoryBinding() {
-  selectedHistoryFile = "";
-  shouldResumeHistory = false;
   const roots = [$("#screen-sessions"), $("#screen-launch")].filter(Boolean);
   for (const root of roots) {
-    ["历史文件", "历史记录", "历史路径", "会话历史"].forEach((label) => {
+    ["历史文件", "历史文件路径", "历史记录", "历史路径", "会话历史"].forEach((label) => {
       const input = findFieldControl(label, root);
       if (input) input.value = "";
     });
   }
 }
 
+function clearSessionTemplateBinding() {
+  currentTemplateName = "";
+  currentSystemTemplate = "";
+  currentSystemTemplateKey = "";
+}
+
 function markFreshSession(reason = "") {
   clearHistoryBinding();
   // 换角色/换场景后不再继续沿用 _temp 的旧角色、旧场景。
-  if (reason === "character" || reason === "background" || reason === "clear-history") {
-    currentTemplateName = "";
+  if (reason === "character" || reason === "background") {
+    clearSessionTemplateBinding();
   }
   refreshAllDerivedState?.();
+}
+
+function sessionTemplateKey(session) {
+  const cast = Array.isArray(session?.characters) ? session.characters : currentCastNames();
+  return JSON.stringify({
+    characters: cast.map((x) => String(x || "").trim()).filter(Boolean),
+    bg_name: String(session?.bg_name || selectedBackgroundName || getField("场景背景", $("#screen-sessions")) || ""),
+    use_effect: String(session?.use_effect || ""),
+    use_translation: String(session?.use_translation || ""),
+    use_cg: String(session?.use_cg || ""),
+    use_cot: String(session?.use_cot || ""),
+    use_choice: String(session?.use_choice || ""),
+    use_narration: String(session?.use_narration || ""),
+    max_speech_chars: Number(session?.max_speech_chars || 0),
+    max_dialog_items: Number(session?.max_dialog_items || 0)
+  });
+}
+
+function setCurrentSystemTemplate(value, key = "") {
+  currentSystemTemplate = String(value || "");
+  currentSystemTemplateKey = currentSystemTemplate ? key : "";
+}
+
+function systemTemplateForLaunch(session) {
+  if (currentSystemTemplateKey && currentSystemTemplateKey !== sessionTemplateKey(session)) return "";
+  return currentSystemTemplate;
+}
+
+function scheduleTemplateAutoGenerate() {
+  window.clearTimeout(templateAutoGenerateTimer);
+  const cast = currentCastNames();
+  if (!cast.length) return;
+  templateAutoGenerateTimer = window.setTimeout(async () => {
+    try {
+      const payload = collectSessionBuilder();
+      const res = await ShinsekaiAPI.generateTemplate(payload);
+      if (!res?.system_template) return;
+      setCurrentSystemTemplate(res.system_template, sessionTemplateKey(payload));
+      renderTemplatePreview({ ...payload, system_template: currentSystemTemplate });
+      refreshAllDerivedState();
+    } catch (err) {
+      console.warn("自动生成模板失败", err);
+    }
+  }, 350);
 }
 
 function collectUserPreferenceText() {
@@ -482,9 +663,7 @@ function installSessionStateGuards() {
       selected_bg: bg,
       bg_name: bg,
       user_preference: collectUserPreferenceText(),
-      user_preferences: collectUserPreferenceText(),
-      // 只有用户明确点“继续/恢复/加载历史”时才带 history_file。
-      history_file: shouldResumeHistory ? (selectedHistoryFile || payload.history_file || "") : ""
+      user_preferences: collectUserPreferenceText()
     });
   };
 
@@ -515,19 +694,20 @@ function installSessionStateGuards() {
     }
 
     if (/继续上次|恢复历史|加载历史|载入历史|打开历史/.test(text)) {
-      shouldResumeHistory = true;
       const path = btn.dataset?.historyFile || btn.dataset?.path || "";
-      if (path) selectedHistoryFile = path;
+      if (path) setField("历史文件路径", path, $("#screen-sessions"));
       return;
     }
 
     if (/加入会话|选择角色|设为出场|移除/.test(text) && btn.closest("#screen-characters, #screen-sessions")) {
       setTimeout(() => markFreshSession("character"), 0);
+      setTimeout(scheduleTemplateAutoGenerate, 0);
       return;
     }
 
     if (/替换场景|加入会话|使用场景|选择场景/.test(text) && btn.closest("#screen-scenes, #screen-sessions")) {
       setTimeout(() => markFreshSession("background"), 0);
+      setTimeout(scheduleTemplateAutoGenerate, 0);
     }
   }, true);
 
@@ -537,7 +717,11 @@ function installSessionStateGuards() {
     const field = el.closest(".field");
     const label = textOf($("label", field));
     if (/出场角色|场景背景|角色|背景/.test(label)) {
+      if (/出场角色|角色/.test(label) && el.closest("#screen-sessions")) {
+        setSelectedSessionCharacters(selectedCharactersFromInput());
+      }
       markFreshSession(/场景|背景/.test(label) ? "background" : "character");
+      scheduleTemplateAutoGenerate();
     }
   }, true);
 }
@@ -565,36 +749,34 @@ function wireOriginalToolModal() {
   const data = {
     about: {
       title: "About",
-      subtitle: "致谢",
+      subtitle: "作者与致谢",
       html: `
-        <div class="input-stack">
-          <div class="field">
-            <label>Original Project / Core Backend</label>
-            <p class="muted-line">
-              Shinsekai 原项目、核心后端实现与本地接口由
-              <a href="https://github.com/RachelForster" target="_blank" rel="noreferrer">不二咲爱笑 / RachelForster</a>
-              创作与维护。
-            </p>
-          </div>
-          <div class="field">
-            <label>WebView Frontend / UI Design</label>
-            <p class="muted-line">
-              <a href="https://github.com/DasterProkio" target="_blank" rel="noreferrer">DasterProkio</a>
-              基于原项目优化 WebUI、界面设计与前端接入体验。
-            </p>
-          </div>
-          <div class="field">
-            <label>Open Source</label>
-            <p class="muted-line">
-              感谢 PySide6 / Qt WebEngine、Vite，以及本项目使用到的各类开源依赖和社区贡献者。
-            </p>
-          </div>
+        <div class="about-card">
+          <section class="about-hero">
+            <div class="about-kicker">Shinsekai Credits</div>
+            <h2 class="about-title">新世界 WebUI</h2>
+            <p class="about-copy">这是基于 Shinsekai 原项目延伸出的本地 WebView 前端。核心后端、角色演出链路与主要 Python 实现来自原作者；当前 WebUI、桌面接入和界面设计在此基础上继续优化。</p>
+          </section>
+          <section class="about-credits">
+            <article class="about-credit">
+              <h3>原项目 / 后端实现</h3>
+              <p class="about-copy">Shinsekai 原项目、核心后端实现、本地配置与演出运行逻辑由 <a href="https://github.com/RachelForster" target="_blank" rel="noreferrer">不二咲爱笑 / RachelForster</a> 创作与维护。</p>
+            </article>
+            <article class="about-credit">
+              <h3>WebUI / 设计优化</h3>
+              <p class="about-copy"><a href="https://github.com/DasterProkio" target="_blank" rel="noreferrer">DasterProkio</a> 在原项目基础上优化 WebUI、桌面 WebView 接入、交互结构与视觉设计体验。</p>
+            </article>
+          </section>
+          <section class="about-credit">
+            <h3>开源致谢</h3>
+            <p class="about-copy">感谢 PySide6 / Qt WebEngine、Vite，以及项目中使用到的各类开源依赖、插件作者与社区贡献者。</p>
+          </section>
         </div>`
     },
     portrait: {
       title: "生成肖像",
       subtitle: "基于角色设定、参考图和提示词批量生成立绘",
-      html: '<div class="field"><label>选择角色</label><select><option>艾莉诺·万斯</option><option>阿里斯·索恩博士</option></select></div><div class="field"><label>生成数量</label><input type="number" value="4"></div><div class="field"><label>参考图</label><input placeholder="选择参考图路径"></div><div class="field"><label>提示词</label><textarea>立绘 1：好奇，微笑，正面视角。\n立绘 2：焦虑，低头，雨夜光线。</textarea></div><div class="field"><label>输出目录</label><input placeholder="data/sprite/output"></div><div class="split-row"><button class="btn-action" data-tool-action="portrait-prompt">生成提示词</button><button class="btn-action" data-tool-action="portrait-generate">生成立绘</button></div>'
+      html: '<div class="field"><label>选择角色</label><select></select></div><div class="field"><label>生成数量</label><input type="number" value="4"></div><div class="field"><label>参考图</label><input placeholder="选择参考图路径"></div><div class="field"><label>提示词</label><textarea></textarea></div><div class="field"><label>输出目录</label><input placeholder="data/sprite/output"></div><div class="split-row"><button class="btn-action" data-tool-action="portrait-prompt">生成提示词</button><button class="btn-action" data-tool-action="portrait-generate">生成立绘</button></div>'
     },
     removebg: {
       title: "抠图",
@@ -654,8 +836,14 @@ function wireTogglesAsStateOnly() {
   $$(".toggle").forEach((toggle) => {
     setToggleState(toggle, toggle.dataset.on !== "false");
     toggle.addEventListener("click", () => {
+      if (toggle.dataset.locked === "true" || toggle.getAttribute("aria-disabled") === "true") return;
       if (toggle.dataset.mcpIndex !== undefined || toggle.dataset.mcpGlobal !== undefined) return;
       setToggleState(toggle, !getToggleState(toggle));
+      if (toggle.dataset.apiToggle === "thinking") syncLlmThinkingUi(undefined, { preserveToggleState: true });
+      if (toggle.closest("#screen-sessions")) {
+        clearSessionTemplateBinding();
+        scheduleTemplateAutoGenerate();
+      }
       refreshAllDerivedState();
     });
     toggle.addEventListener("keydown", (event) => {
@@ -663,6 +851,12 @@ function wireTogglesAsStateOnly() {
       event.preventDefault();
       toggle.click();
     });
+  });
+
+  const thinkingRow = $("#screen-services [data-llm-thinking-row]");
+  thinkingRow?.addEventListener("click", (event) => {
+    if (event.target.closest(".toggle") || thinkingRow.classList.contains("is-disabled")) return;
+    findApiToggle("thinking")?.click();
   });
 }
 
@@ -713,7 +907,8 @@ function collectApiConfig() {
     llm_model: getField("模型ID", services),
     api_key: getField("API Key", services),
     base_url: getField("Base URL", services),
-    is_streaming: yesNoFromToggle($(".section-group .toggle", services)),
+    is_streaming: getApiToggleState("streaming", true) ? "是" : "否",
+    llm_extra_configs: collectLlmExtraConfigs(llmProvider),
 
     temperature: Number(getField("温度", services) || 0.7),
     presence_penalty: Number(getField("presence_penalty", services) || 0),
@@ -749,6 +944,8 @@ function hydrateApiConfig(api) {
   setField("模型ID", mapProviderValue(api.llm_model, provider, api.llm_model_current || api.llm_model || ""), services);
   setField("Base URL", api.llm_base_url || api.base_url || "", services);
   setField("API Key", mapProviderValue(api.llm_api_key, provider, api.llm_api_key_current || api.api_key || ""), services);
+  setApiToggleState("streaming", api.is_streaming !== false);
+  syncLlmThinkingUi(provider);
 
   setField("温度", api.temperature, services);
   setField("presence_penalty", api.presence_penalty, services);
@@ -769,25 +966,36 @@ function hydrateApiConfig(api) {
 
 function collectCharacterEditor() {
   const root = $("#screen-characters");
+  const boundName = root?.dataset.currentCharacterName || "";
+  const current = normalizeCharacters(backendState).find((c) => c.name === boundName) || {};
+  const name = getField("人物名称", root) || current.name || "";
+  const color = getField("名称显示颜色", root) || current.color || "";
+  const spritePrefix = getField("上传数据目录名", root) || getField("资源目录名", root) || current.sprite_prefix || "";
   return {
-    name: getField("人物名称", root),
-    color: getField("名称显示颜色", root),
-    sprite_prefix: getField("上传数据目录名", root) || getField("资源目录名", root) || "",
+    ...current,
+    name,
+    color,
+    sprite_prefix: spritePrefix,
     character_setting: getField("角色设定", root),
-    sprites: [],
-    emotion_tags: ""
+    sprites: Array.isArray(current.sprites) ? current.sprites : [],
+    emotion_tags: current.emotion_tags || ""
   };
 }
 
 function collectBackgroundEditor() {
   const root = $("#screen-scenes");
+  const boundName = root?.dataset.currentBackgroundName || "";
+  const current = normalizeBackgrounds(backendState).find((b) => b.name === boundName) || {};
+  const name = getField("场景名称", root) || current.name || "";
+  const spritePrefix = getField("资源目录名", root) || current.sprite_prefix || "";
   return {
-    name: getField("场景名称", root),
-    sprite_prefix: getField("资源目录名", root),
+    ...current,
+    name,
+    sprite_prefix: spritePrefix,
     bg_tags: getField("图片说明 / 标签", root),
-    sprites: [],
-    bgm_list: [],
-    bgm_tags: ""
+    sprites: Array.isArray(current.sprites) ? current.sprites : [],
+    bgm_list: Array.isArray(current.bgm_list) ? current.bgm_list : [],
+    bgm_tags: current.bgm_tags || ""
   };
 }
 
@@ -797,7 +1005,7 @@ function collectSessionBuilder() {
   return {
     session_name: getField("会话名称", root) || getField("会话昵称", root),
     language: getField("目标语言", root),
-    characters: (selectedSessionCharacters.length ? selectedSessionCharacters : getField("出场角色", root).split(",").map((x) => x.trim()).filter(Boolean)),
+    characters: currentCastNames(),
     bg_name: selectedBackgroundName || getField("场景背景", root),
     scenario: getField("用户情景", root),
     system_template: currentSystemTemplate,
@@ -821,6 +1029,7 @@ function characterMeta(character) {
 }
 
 function fillCharacterCard(card, character, index) {
+  card.removeAttribute("data-template-card");
   const badge = $(".floating-badge", card);
   const name = $(".char-name", card);
   const meta = $(".char-meta", card);
@@ -855,26 +1064,49 @@ function fillCharacterCard(card, character, index) {
 
 function hydrateCharacterEditor(character) {
   const root = $("#screen-characters");
+  if (root) root.dataset.currentCharacterName = character?.name || "";
   setField("人物名称", character.name || "", root);
   setField("名称显示颜色", character.color || "", root);
   setField("角色设定", character.character_setting || "", root);
-  const tiles = $$(".gallery-tile", root);
+  renderCharacterGallery(character);
+}
+
+function renderCharacterGallery(character) {
+  const root = $("#screen-characters");
+  const strip = $(".detail-card.drawer .gallery-strip", root);
+  if (!strip) return;
   const sprites = Array.isArray(character.sprites) ? character.sprites : [];
-  tiles.forEach((tile, index) => applyImageToBox(tile, resourcePath(sprites[index]), "contain", "center top"));
+  if (!sprites.length) {
+    strip.innerHTML = '<div class="gallery-tile"><span class="floating-badge">无立绘</span></div>';
+    return;
+  }
+  strip.innerHTML = sprites.map((sprite, index) => {
+    const label = escapeHtml(characterSpriteLabel(character, sprite, index));
+    const path = escapeHtml(resourcePath(sprite));
+    return `<div class="gallery-tile" data-character-sprite-index="${index}" data-character-sprite-path="${path}" title="${label} | ${path}"><span class="floating-badge">${label}</span></div>`;
+  }).join("");
+  $$("[data-character-sprite-path]", strip).forEach((tile, index) => {
+    const path = tile.dataset.characterSpritePath || resourcePath(sprites[index]);
+    applyImageToBox(tile, path, "contain", "center top");
+  });
 }
 
 function addCharacterToSession(name) {
   if (!name) return;
-  selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput());
+  clearSessionTemplateBinding();
+  clearHistoryBinding();
+  selectedSessionCharacters = currentCastNames();
   if (!selectedSessionCharacters.includes(name)) selectedSessionCharacters.push(name);
+  selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters);
   syncSelectedCharactersInput();
   renderCurrentCastList();
   refreshAllDerivedState();
 }
 
 function removeCharacterFromSession(name) {
-  selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput())
-    .filter((x) => x !== name);
+  clearSessionTemplateBinding();
+  clearHistoryBinding();
+  selectedSessionCharacters = currentCastNames().filter((x) => x !== name);
   syncSelectedCharactersInput();
   renderCurrentCastList();
   refreshAllDerivedState();
@@ -882,8 +1114,7 @@ function removeCharacterFromSession(name) {
 
 function renderCurrentCastList() {
   const characters = normalizeCharacters(backendState);
-  selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput());
-  const selected = selectedSessionCharacters
+  const selected = currentCastNames()
     .map((name) => characters.find((c) => c.name === name) || { name })
     .filter((c) => c.name);
   const castList = $("#screen-characters aside:last-child .ext-list");
@@ -913,7 +1144,7 @@ function hydrateCharacters(state) {
   });
   hydrateCharacterEditor(characters[0]);
 
-  selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput());
+  currentCastNames();
   syncSelectedCharactersInput();
   renderCurrentCastList();
 }
@@ -925,6 +1156,7 @@ function backgroundMeta(bg) {
 }
 
 function fillBackgroundCard(card, bg, index) {
+  card.removeAttribute("data-template-card");
   const badge = $(".floating-badge", card);
   const name = $(".char-name", card);
   const meta = $(".char-meta", card);
@@ -953,6 +1185,30 @@ function previewLabelForResource(item, index) {
   return path.split(/[\\/]/).pop() || `图 ${index + 1}`;
 }
 
+function indexedTagLabel(text, index, prefix = "") {
+  const wanted = index + 1;
+  const padded = String(wanted).padStart(2, "0");
+  const lines = String(text || "").replace(/\r\n/g, "\n").split("\n").map((line) => line.trim()).filter(Boolean);
+  for (const line of lines) {
+    const match = line.match(/^(?:立绘|场景|sprite)\s*0?(\d+)\s*[：:]\s*(.*)$/i)
+      || line.match(/^0?(\d+)\s*[：:]\s*(.*)$/);
+    if (!match || Number(match[1]) !== wanted) continue;
+    const body = String(match[2] || "").trim();
+    return body ? `${padded} · ${body}` : `${prefix || "图"} ${padded}`;
+  }
+  return "";
+}
+
+function characterSpriteLabel(character, sprite, index) {
+  return indexedTagLabel(character?.emotion_tags, index, "立绘")
+    || previewLabelForResource(sprite, index);
+}
+
+function backgroundSpriteLabel(bg, sprite, index) {
+  return indexedTagLabel(bg?.bg_tags, index, "场景")
+    || previewLabelForResource(sprite, index);
+}
+
 function renderBackgroundGallery(bg) {
   const root = $("#screen-scenes");
   const strip = $(".detail-card.drawer .gallery-strip", root);
@@ -963,9 +1219,9 @@ function renderBackgroundGallery(bg) {
     return;
   }
   strip.innerHTML = sprites.map((sprite, index) => {
-    const label = escapeHtml(previewLabelForResource(sprite, index));
+    const label = escapeHtml(backgroundSpriteLabel(bg, sprite, index));
     const path = escapeHtml(resourcePath(sprite));
-    return `<div class="gallery-tile" data-bg-sprite-index="${index}" data-bg-sprite-path="${path}" title="${path}"><span class="floating-badge">${label}</span></div>`;
+    return `<div class="gallery-tile" data-bg-sprite-index="${index}" data-bg-sprite-path="${path}" title="${label} | ${path}"><span class="floating-badge">${label}</span></div>`;
   }).join("");
   $$('[data-bg-sprite-path]', strip).forEach((tile, index) => {
     const path = tile.dataset.bgSpritePath || resourcePath(sprites[index]);
@@ -1036,6 +1292,7 @@ function updateSelectedBackgroundPanel(bg = currentBackground()) {
 
 function hydrateBackgroundEditor(bg) {
   const root = $("#screen-scenes");
+  if (root) root.dataset.currentBackgroundName = bg?.name || "";
   setField("场景名称", bg.name || "", root);
   setField("资源目录名", bg.sprite_prefix || "", root);
   setField("图片说明 / 标签", bg.bg_tags || "", root);
@@ -1051,6 +1308,8 @@ function hydrateBackgroundEditor(bg) {
 }
 
 function setSessionBackground(name) {
+  clearSessionTemplateBinding();
+  clearHistoryBinding();
   selectedBackgroundName = name || "";
   const bg = normalizeBackgrounds(backendState).find((item) => item.name === selectedBackgroundName) || null;
   selectedBackgroundSpritePath = firstResourcePath(bg?.sprites);
@@ -1087,22 +1346,17 @@ function hydrateTemplatesAndHistories(state) {
   const templateSelect = $("aside .section-group select", root);
   if (templateSelect && templates.length) {
     setSelectOptions(templateSelect, templates.map((t) => t.name));
-    const preferred = templates.find((t) => t.name === currentTemplateName) || templates.find((t) => t.name === "_temp.txt") || templates[0];
-    currentTemplateName = preferred.name;
-    templateSelect.value = currentTemplateName;
+    const preferred = templates.find((t) => t.name === currentTemplateName) || templates[0];
+    templateSelect.value = preferred.name;
     const sessionNameInput = findFieldControl("会话名称", root) || findFieldControl("会话昵称", root);
-    if (sessionNameInput && looksLikeMockSessionName(sessionNameInput.value)) {
-      sessionNameInput.value = templateDisplayName(currentTemplateName);
-    }
-    if (!didAutoLoadInitialTemplate) {
-      didAutoLoadInitialTemplate = true;
-      void loadTemplateIntoSession(currentTemplateName, { silent: true, replaceMockOnly: true });
+    if (sessionNameInput && isBlankSessionName(sessionNameInput.value)) {
+      sessionNameInput.value = "未命名会话";
     }
   } else {
     const sessionNameInput = findFieldControl("会话名称", root) || findFieldControl("会话昵称", root);
     const scenarioInput = findFieldControl("用户情景", root);
-    if (sessionNameInput && looksLikeMockSessionName(sessionNameInput.value)) sessionNameInput.value = "未命名会话";
-    if (scenarioInput && looksLikeMockScenario(scenarioInput.value)) scenarioInput.value = "";
+    if (sessionNameInput && isBlankSessionName(sessionNameInput.value)) sessionNameInput.value = "未命名会话";
+    if (scenarioInput && isBlankScenario(scenarioInput.value)) scenarioInput.value = "";
   }
 
   const historyGroup = $$("#screen-sessions aside .section-group").find((g) => textOf($(".section-label", g)) === "最近历史");
@@ -1111,13 +1365,8 @@ function hydrateTemplatesAndHistories(state) {
     historyGroup.innerHTML = label + histories.slice(0, 5).map((h) => `<div class="timeline-item"><h4>${h.name}</h4><p class="muted-line">最后修改：${formatMtime(h.mtime)}</p></div>`).join("");
   }
 
-  if (histories.length) {
-    const historyInput = findFieldControl("历史文件路径", root);
-    if (historyInput && !String(historyInput.value || "").trim()) historyInput.value = histories[0].path || histories[0].name || "";
-  }
-
   const bg = firstBackground();
-  selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput());
+  currentCastNames();
   syncSelectedCharactersInput();
   if (!selectedBackgroundName && bg) {
     selectedBackgroundName = bg.name || "";
@@ -1135,8 +1384,8 @@ function hydrateLaunchSummary(state) {
       if (spans[1]) spans[1].textContent = bg.name;
     });
   }
-  selectedSessionCharacters = sanitizeSessionCharacterNames(selectedSessionCharacters.length ? selectedSessionCharacters : selectedCharactersFromInput());
-  const roleLabel = selectedSessionCharacters.length ? selectedSessionCharacters.join("、") : "未选择";
+  const cast = currentCastNames();
+  const roleLabel = cast.length ? cast.join("、") : "未选择";
   const roleRows = $$(".check-row", launch).filter((r) => textOf($("span:first-child", r)) === "角色");
   roleRows.forEach((row) => {
     const spans = $$("span", row);
@@ -1203,7 +1452,10 @@ function hydrateStatusPanels(state) {
     const label = textOf($$("span", row)[0]);
     const pill = $(".status-pill", row);
     if (label === "LLM") setStatusPill(pill, hasLlm ? "OK" : "MISS", hasLlm);
-    if (label === "角色") setStatusPill(pill, String(selectedSessionCharacters.length || 0), selectedSessionCharacters.length > 0);
+    if (label === "角色") {
+      const cast = currentCastNames();
+      setStatusPill(pill, String(cast.length || 0), cast.length > 0);
+    }
     if (label === "背景") setStatusPill(pill, bgs.length ? "OK" : "MISS", bgs.length > 0);
     if (label === "模板") setStatusPill(pill, currentSystemTemplate || getField("用户情景", $("#screen-sessions")) ? "READY" : "EMPTY", !!(currentSystemTemplate || getField("用户情景", $("#screen-sessions"))));
   });
@@ -1214,7 +1466,12 @@ function hydrateSessionPlugins(state) {
   const list = $("#screen-sessions aside:last-child .ext-list");
   if (!list) return;
   list.innerHTML = plugins.length
-    ? plugins.slice(0, 5).map((p) => `<li class="ext-item" style="padding:10px 0;" data-session-plugin="${escapeHtml(p.entry || "")}"><div class="ext-info"><h4>${escapeHtml(pluginDisplayName(p, 0))}</h4><p>${escapeHtml(pluginSubtitle(p))}</p></div><span style="font-size: 10px; text-decoration: underline;" data-plugin-session-settings="${escapeHtml(p.entry || "")}">设置</span></li>`).join("")
+    ? plugins.slice(0, 5).map((p) => {
+      const panelLink = pluginHasPanel(p)
+        ? `<span style="font-size: 10px; text-decoration: underline;" data-plugin-session-settings="${escapeHtml(p.entry || "")}">设置</span>`
+        : "";
+      return `<li class="ext-item" style="padding:10px 0;" data-session-plugin="${escapeHtml(p.entry || "")}"><div class="ext-info"><h4>${escapeHtml(pluginDisplayName(p, 0))}</h4><p>${escapeHtml(pluginSubtitle(p))}</p></div>${panelLink}</li>`;
+    }).join("")
     : '<li class="ext-item" style="padding:10px 0;"><div class="ext-info"><h4>暂无活跃插件</h4><p>到服务页启用插件</p></div></li>';
   list.onclick = async (event) => {
     const el = event.target.closest("[data-plugin-session-settings]");
@@ -1442,8 +1699,96 @@ function pluginSubtitle(plugin) {
   const enabled = plugin?.enabled === false ? "未启用" : "已启用";
   const loaded = plugin?.loaded ? "已加载" : "未加载/待重启";
   const version = plugin?.plugin_version ? ` // v${plugin.plugin_version}` : "";
-  const settings = plugin?.has_settings ? " // 有设置页" : "";
-  return `${enabled} // ${loaded}${version}${settings}`;
+  const surfaces = [];
+  if (plugin?.has_settings) surfaces.push("有设置页");
+  if (plugin?.has_tools) surfaces.push("有工具页");
+  const surfaceText = surfaces.length ? ` // ${surfaces.join(" / ")}` : "";
+  return `${enabled} // ${loaded}${version}${surfaceText}`;
+}
+
+function pluginHasPanel(plugin) {
+  return Boolean(
+    plugin?.has_settings
+    || plugin?.has_tools
+    || (Array.isArray(plugin?.settings_contributions) && plugin.settings_contributions.length)
+    || (Array.isArray(plugin?.tools_contributions) && plugin.tools_contributions.length)
+  );
+}
+
+function pluginCatalogSubtitle(item) {
+  const repo = item?.repo || "未声明仓库";
+  const author = item?.author ? `作者：${item.author}` : "作者未知";
+  return `${item?.status_label || "可安装"} // ${author} // ${repo}`;
+}
+
+function renderPluginCatalog(pluginCard) {
+  const list = $("[data-plugin-catalog-list]", pluginCard);
+  const status = $("[data-plugin-catalog-status]", pluginCard);
+  if (!list) return;
+  if (status) {
+    if (pluginCatalogState.loading) status.textContent = "正在读取远程插件索引…";
+    else if (pluginCatalogState.error) status.textContent = `读取失败：${pluginCatalogState.error}`;
+    else if (pluginCatalogState.loaded) status.textContent = `已读取 ${pluginCatalogState.catalog.length} 个插件。`;
+    else status.textContent = "尚未读取远程插件索引。";
+  }
+  if (pluginCatalogState.loading) {
+    list.innerHTML = '<li class="ext-item" style="padding-left:0;"><div class="ext-info"><h4>读取中</h4><p>正在连接插件市场。</p></div></li>';
+    return;
+  }
+  if (pluginCatalogState.error) {
+    list.innerHTML = `<li class="ext-item" style="padding-left:0;"><div class="ext-info"><h4>市场读取失败</h4><p>${escapeHtml(pluginCatalogState.error)}</p></div><button class="btn-action" data-plugin-catalog-refresh>重试</button></li>`;
+    return;
+  }
+  if (!pluginCatalogState.catalog.length) {
+    list.innerHTML = '<li class="ext-item" style="padding-left:0;"><div class="ext-info"><h4>暂无市场数据</h4><p>点击刷新市场读取远程 plugins.json。</p></div></li>';
+    return;
+  }
+  list.innerHTML = pluginCatalogState.catalog.map((item, index) => {
+    const github = item.github_url
+      ? `<a class="btn-action" href="${escapeHtml(item.github_url)}" target="_blank" rel="noreferrer" style="text-decoration:none;">GitHub</a>`
+      : '<button class="btn-action" disabled>GitHub</button>';
+    const disabled = item.repo ? "" : " disabled";
+    const overwrite = item.downloaded || item.installed ? "true" : "false";
+    return `<li class="ext-item" style="padding-left:0;" data-catalog-index="${index}">
+      <div class="ext-info"><h4>${escapeHtml(item.name || item.repo || `插件 ${index + 1}`)}</h4><p>${escapeHtml(pluginCatalogSubtitle(item))}</p><p>${escapeHtml(item.description || "暂无说明。")}</p></div>
+      <div style="display:flex; gap:8px; align-items:center; flex-wrap:wrap;">${github}<button class="btn-action" data-plugin-catalog-install="${index}" data-overwrite="${overwrite}"${disabled}>${escapeHtml(item.action_label || "安装")}</button></div>
+    </li>`;
+  }).join("");
+}
+
+async function loadPluginCatalog({ force = false } = {}) {
+  const services = $("#screen-services");
+  const pluginCard = $$("#screen-services .center-grid > .detail-card")
+    .find((card) => textOf($(".char-name", card)).includes("插件服务"));
+  if (!pluginCard || (pluginCatalogState.loaded && !force) || pluginCatalogState.loading) return;
+  pluginCatalogState = { ...pluginCatalogState, loading: true, error: "" };
+  renderPluginCatalog(pluginCard);
+  try {
+    const res = await ShinsekaiAPI.listPluginCatalog();
+    pluginCatalogState = {
+      catalog: Array.isArray(res.catalog) ? res.catalog : [],
+      error: res.error || "",
+      loaded: true,
+      loading: false
+    };
+  } catch (err) {
+    pluginCatalogState = { catalog: [], error: err.message, loaded: true, loading: false };
+  }
+  renderPluginCatalog(pluginCard);
+  if (services) hydrateStatusPanels(backendState || {});
+}
+
+function switchPluginPanel(pluginCard, tab) {
+  $$("[data-plugin-panel]", pluginCard).forEach((panel) => {
+    panel.hidden = panel.dataset.pluginPanel !== tab;
+  });
+  $$("[data-plugin-tab]", pluginCard).forEach((btn) => {
+    const active = btn.dataset.pluginTab === tab;
+    btn.classList.toggle("active", active);
+    btn.style.background = active ? "black" : "";
+    btn.style.color = active ? "white" : "";
+  });
+  if (tab === "discover") loadPluginCatalog();
 }
 
 function hydratePlugins(state) {
@@ -1451,7 +1796,7 @@ function hydratePlugins(state) {
   const plugins = Array.isArray(state?.plugins) ? state.plugins : [];
   const pluginCard = $$("#screen-services .center-grid > .detail-card")
     .find((card) => textOf($(".char-name", card)).includes("插件服务"));
-  const list = $(".ext-list", pluginCard);
+  const list = $("[data-plugin-manage-list]", pluginCard) || $(".ext-list", pluginCard);
   if (!list) return;
 
   if (!plugins.length) {
@@ -1460,7 +1805,10 @@ function hydratePlugins(state) {
     list.innerHTML = plugins.map((plugin, index) => {
       const entry = String(plugin?.entry || "");
       const enabled = plugin?.enabled !== false;
-      return `<li class="ext-item" style="padding-left: 0;" data-plugin-entry="${encodeURIComponent(entry)}"><div class="ext-info"><h4>${pluginDisplayName(plugin, index)}</h4><p>${pluginSubtitle(plugin)}</p></div><div style="display:flex; gap:8px; align-items:center;"><button class="btn-action" data-plugin-action="settings" data-entry="${encodeURIComponent(entry)}">设置</button><button class="btn-action" data-plugin-action="toggle" data-enabled="${enabled ? "true" : "false"}" data-entry="${encodeURIComponent(entry)}">${enabled ? "禁用" : "启用"}</button></div></li>`;
+      const settingsButton = pluginHasPanel(plugin)
+        ? `<button class="btn-action" data-plugin-action="settings" data-entry="${encodeURIComponent(entry)}">设置</button>`
+        : "";
+      return `<li class="ext-item" style="padding-left: 0;" data-plugin-entry="${encodeURIComponent(entry)}"><div class="ext-info"><h4>${escapeHtml(pluginDisplayName(plugin, index))}</h4><p>${escapeHtml(pluginSubtitle(plugin))}</p></div><div style="display:flex; gap:8px; align-items:center;">${settingsButton}<button class="btn-action" data-plugin-action="toggle" data-enabled="${enabled ? "true" : "false"}" data-entry="${encodeURIComponent(entry)}">${enabled ? "禁用" : "启用"}</button></div></li>`;
     }).join("");
   }
 
@@ -1471,7 +1819,7 @@ function hydratePlugins(state) {
       if (row) {
         const entry = decodeURIComponent(row.dataset.pluginEntry || "");
         const plugin = (backendState?.plugins || []).find((p) => String(p.entry || "") === entry) || { entry };
-        openPluginDetailEditor(plugin);
+        if (pluginHasPanel(plugin)) openPluginDetailEditor(plugin);
       }
       return;
     }
@@ -1513,6 +1861,55 @@ function hydratePlugins(state) {
       }
     };
   }
+
+  renderPluginCatalog(pluginCard);
+
+  $$("[data-plugin-tab]", pluginCard).forEach((btn) => {
+    btn.onclick = () => switchPluginPanel(pluginCard, btn.dataset.pluginTab || "manage");
+  });
+  $$("[data-plugin-catalog-refresh]", pluginCard).forEach((btn) => {
+    btn.onclick = () => loadPluginCatalog({ force: true });
+  });
+  const catalogList = $("[data-plugin-catalog-list]", pluginCard);
+  if (catalogList) {
+    catalogList.onclick = async (event) => {
+      const refresh = event.target.closest("[data-plugin-catalog-refresh]");
+      if (refresh) {
+        loadPluginCatalog({ force: true });
+        return;
+      }
+      const btn = event.target.closest("[data-plugin-catalog-install]");
+      if (!btn) return;
+      const index = Number(btn.dataset.pluginCatalogInstall);
+      const item = pluginCatalogState.catalog[index];
+      if (!item) return;
+      const verb = btn.dataset.overwrite === "true" ? "更新" : "安装";
+      if (!window.confirm(`确认${verb}插件「${item.name || item.repo}」？这会下载 GitHub 插件并安装 requirements.txt 依赖。`)) return;
+      btn.disabled = true;
+      btn.textContent = `${verb}中`;
+      try {
+        const res = await ShinsekaiAPI.installCatalogPlugin({
+          name: item.name,
+          repo: item.repo,
+          entry: item.entry,
+          overwrite: btn.dataset.overwrite === "true"
+        });
+        backendState = { ...backendState, plugins: res.plugins || backendState?.plugins };
+        pluginCatalogState = {
+          catalog: Array.isArray(res.catalog) ? res.catalog : pluginCatalogState.catalog,
+          error: res.error || "",
+          loaded: true,
+          loading: false
+        };
+        hydratePlugins(backendState);
+        notify(res.message || "插件已安装");
+      } catch (err) {
+        notify(`插件安装失败：${err.message}`);
+        btn.disabled = false;
+        btn.textContent = verb;
+      }
+    };
+  }
 }
 
 
@@ -1529,7 +1926,7 @@ function hydrateRealProjectState(state) {
   hydrateSessionPlugins(state);
 }
 
-async function loadTemplateIntoSession(name, { silent = false, replaceMockOnly = false } = {}) {
+async function loadTemplateIntoSession(name, { silent = false, replaceBlankOnly = false } = {}) {
   const root = $("#screen-sessions");
   if (!name) {
     if (!silent) notify("没有可加载的模板文件");
@@ -1537,17 +1934,22 @@ async function loadTemplateIntoSession(name, { silent = false, replaceMockOnly =
   }
   const res = await ShinsekaiAPI.loadTemplate(name);
   currentTemplateName = res.name || name;
-  currentSystemTemplate = res.system_template || "";
+  const rawTemplate = res?.system_template ? "" : await loadRawTemplateText(currentTemplateName);
+  const loaded = normalizeLoadedTemplate(res, rawTemplate);
+  setCurrentSystemTemplate(loaded.system);
 
   const sessionNameInput = findFieldControl("会话名称", root) || findFieldControl("会话昵称", root);
   const scenarioInput = findFieldControl("用户情景", root);
   const displayName = templateDisplayName(currentTemplateName);
-  const scenario = String(res.scenario || "").trim();
+  const scenario = loaded.scenario;
 
-  if (sessionNameInput && (!replaceMockOnly || looksLikeMockSessionName(sessionNameInput.value))) {
+  if (sessionNameInput && (!replaceBlankOnly || isBlankSessionName(sessionNameInput.value))) {
     sessionNameInput.value = displayName || currentTemplateName;
   }
-  if (scenarioInput && scenario && !scenario.startsWith("加载失败") && (!replaceMockOnly || looksLikeMockScenario(scenarioInput.value))) {
+  if (scenarioInput && loaded.legacyCombined && !replaceBlankOnly) {
+    scenarioInput.value = "";
+  }
+  if (scenarioInput && scenario && !scenario.startsWith("加载失败") && (!replaceBlankOnly || isBlankScenario(scenarioInput.value))) {
     scenarioInput.value = scenario;
   }
 
@@ -1555,7 +1957,7 @@ async function loadTemplateIntoSession(name, { silent = false, replaceMockOnly =
   if (preview) {
     const hasScenario = !!(scenario && !scenario.startsWith("加载失败"));
     preview.textContent = currentSystemTemplate
-      ? `已加载模板：${currentTemplateName}`
+      ? `已加载模板：${currentTemplateName}${loaded.legacyCombined ? "（旧版整段模板）" : ""}`
       : `已加载模板：${currentTemplateName}${hasScenario ? "（仅用户情景）" : "（无系统段）"}`;
   }
   refreshAllDerivedState();
@@ -1566,7 +1968,7 @@ async function loadTemplateIntoSession(name, { silent = false, replaceMockOnly =
 async function loadSelectedTemplate() {
   const root = $("#screen-sessions");
   const select = $("aside .section-group select", root);
-  return loadTemplateIntoSession(select?.value, { silent: false, replaceMockOnly: false });
+  return loadTemplateIntoSession(select?.value, { silent: false, replaceBlankOnly: false });
 }
 
 async function saveCurrentTemplate(copy = false) {
@@ -1579,6 +1981,12 @@ async function saveCurrentTemplate(copy = false) {
     system_template: currentSystemTemplate
   });
   notify(res?.message || "模板已保存");
+}
+
+function buildFreshHistoryFilePath() {
+  const stamp = new Date().toISOString().replace(/\D/g, "").slice(0, 14);
+  const suffix = Math.random().toString(36).slice(2, 8);
+  return `data/chat_history/webui_${stamp}_${suffix}.json`;
 }
 
 
@@ -1657,11 +2065,20 @@ function openEditorModal({ title, subtitle = "详细设置", fields = [], onSave
   };
 }
 
+function shouldHideEditorField(key) {
+  const normalized = String(key || "").trim().toLowerCase();
+  return !normalized
+    || normalized.startsWith("_")
+    || normalized === "html"
+    || normalized.startsWith("debug")
+    || normalized.includes("mock");
+}
+
 function fieldsFromObject(obj, preferred = []) {
   const seen = new Set();
   const fields = [];
   [...preferred, ...Object.keys(obj || {})].forEach((key) => {
-    if (seen.has(key) || key.startsWith("_")) return;
+    if (seen.has(key) || shouldHideEditorField(key)) return;
     seen.add(key);
     fields.push({ key, label: key, value: obj?.[key] });
   });
@@ -1846,6 +2263,7 @@ async function openPluginDetailEditor(plugin) {
   const values = configSchema.values || {};
   const fields = configSchema.fields || [];
   const intro = Array.isArray(configSchema.intro) ? configSchema.intro.filter(Boolean) : [];
+  const schemaKind = configSchema.kind || configSchema.save_mode || "";
 
   function inputValue(key, fallback = "") {
     const value = values[key];
@@ -1853,38 +2271,71 @@ async function openPluginDetailEditor(plugin) {
     return value;
   }
 
+  function numberAttrs(field) {
+    const attrs = [];
+    if (field.min !== undefined && field.min !== null) attrs.push(`min="${escapeHtml(field.min)}"`);
+    if (field.max !== undefined && field.max !== null) attrs.push(`max="${escapeHtml(field.max)}"`);
+    if (field.step !== undefined && field.step !== null) attrs.push(`step="${escapeHtml(field.step)}"`);
+    return attrs.join(" ");
+  }
+
   function renderConfigField(field) {
     const key = field.name;
     const label = field.label || key;
     const typeText = String(field.type || "").toLowerCase();
+    const uiType = String(field.ui || "").toLowerCase();
     const value = inputValue(key, field.default ?? "");
     const help = field.help ? `<p class="muted-line" style="white-space:pre-line; margin-top:6px;">${escapeHtml(field.help)}</p>` : "";
     const placeholder = field.placeholder ? ` placeholder="${escapeHtml(field.placeholder)}"` : "";
+    const isJson = typeText.includes("json") || uiType === "json";
+    const isWide = isJson || uiType === "textarea" || field.multiline;
+    const fieldClass = `field${isWide ? " wide-field" : ""}`;
+
+    if (uiType === "color" || typeText.includes("color")) {
+      const color = /^#[0-9a-f]{6}$/i.test(String(value || "")) ? value : (field.default || "#ffffff");
+      return `<div class="${fieldClass}"><label>${escapeHtml(label)}</label><input type="color" data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="str" value="${escapeHtml(color)}">${help}</div>`;
+    }
 
     if (Array.isArray(field.choices) && field.choices.length) {
       const options = field.choices.map((choice, i) => {
         const labelText = (field.labels && field.labels[i]) || choice;
         return `<option value="${escapeHtml(choice)}" ${String(choice) === String(value) ? "selected" : ""}>${escapeHtml(labelText)}</option>`;
       }).join("");
-      return `<div class="field"><label>${escapeHtml(label)}</label><select data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="select">${options}</select>${help}</div>`;
+      const valueType = typeText.includes("int") ? "int" : (typeText.includes("float") ? "float" : "str");
+      return `<div class="${fieldClass}"><label>${escapeHtml(label)}</label><select data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="select" data-plugin-config-value-type="${valueType}">${options}</select>${help}</div>`;
     }
 
     if (typeText.includes("bool")) {
-      return `<div class="field"><label>${escapeHtml(label)}</label><div class="check-row" data-plugin-bool-row><span>${inputValue(key) ? "已启用" : "已关闭"}</span><button class="toggle" data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="bool" data-value="${value ? "true" : "false"}"></button></div>${help}</div>`;
+      return `<div class="${fieldClass}"><label>${escapeHtml(label)}</label><div class="check-row" data-plugin-bool-row><span>${inputValue(key) ? "已启用" : "已关闭"}</span><button class="toggle" data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="bool" data-value="${value ? "true" : "false"}"></button></div>${help}</div>`;
     }
 
     if (typeText.includes("float") || typeText.includes("int")) {
-      const step = typeText.includes("int") ? "1" : "0.01";
+      const step = field.step ?? (typeText.includes("int") ? "1" : "0.01");
       const dataType = typeText.includes("int") ? "int" : "float";
-      return `<div class="field"><label>${escapeHtml(label)}</label><input type="number" step="${step}" data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="${dataType}" value="${escapeHtml(value)}">${help}</div>`;
+      const attrs = numberAttrs({ ...field, step });
+      return `<div class="${fieldClass}"><label>${escapeHtml(label)}</label><input type="number" ${attrs} data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="${dataType}" value="${escapeHtml(value)}">${help}</div>`;
     }
 
-    const longText = String(value || "").length > 80 || key.startsWith("question");
-    if (longText) {
-      return `<div class="field"><label>${escapeHtml(label)}</label><textarea data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="str"${placeholder}>${escapeHtml(value)}</textarea>${help}</div>`;
+    if (isJson) {
+      return `<div class="${fieldClass}"><label>${escapeHtml(label)}</label><textarea data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="json"${placeholder}>${escapeHtml(jsonText(value || field.default || {}))}</textarea>${help}</div>`;
     }
-    return `<div class="field"><label>${escapeHtml(label)}</label><input data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="str" value="${escapeHtml(value)}"${placeholder}>${help}</div>`;
+
+    const longText = uiType === "textarea" || field.multiline || String(value || "").length > 80 || key.startsWith("question");
+    if (longText) {
+      return `<div class="${fieldClass}"><label>${escapeHtml(label)}</label><textarea data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="str"${placeholder}>${escapeHtml(value)}</textarea>${help}</div>`;
+    }
+    return `<div class="${fieldClass}"><label>${escapeHtml(label)}</label><input data-plugin-config-field="${escapeHtml(key)}" data-plugin-config-type="str" value="${escapeHtml(value)}"${placeholder}>${help}</div>`;
   }
+
+  let lastSection = "";
+  const fieldsHtml = fields.map((field) => {
+    const section = String(field.section || "");
+    const header = section && section !== lastSection
+      ? `<span class="section-label plugin-section-label">${escapeHtml(section)}</span>`
+      : "";
+    lastSection = section;
+    return `${header}${renderConfigField(field)}`;
+  }).join("");
 
   const introHtml = intro.length
     ? `<div class="detail-card wide-card"><div class="detail-body input-stack">${intro.map((p) => `<p class="muted-line" style="white-space:pre-line;">${escapeHtml(p)}</p>`).join("")}</div></div>`
@@ -1898,7 +2349,7 @@ async function openPluginDetailEditor(plugin) {
         <span class="status-pill ${configSchema.exists ? "status-available" : "status-unconfigured"}">${configSchema.exists ? "已读取" : "默认值"}</span>
       </div>
       <div class="detail-body input-stack">
-        <div class="mini-grid">${fields.map(renderConfigField).join("")}</div>
+        <div class="mini-grid">${fieldsHtml}</div>
         <div class="split-row"><button class="btn-action" data-plugin-save-config>保存设置</button></div>
       </div>
     </div>
@@ -1930,12 +2381,15 @@ async function openPluginDetailEditor(plugin) {
         content.querySelectorAll("[data-plugin-config-field]").forEach((node) => {
           const key = node.dataset.pluginConfigField;
           const type = node.dataset.pluginConfigType || "str";
+          const valueType = node.dataset.pluginConfigValueType || type;
           if (!key) return;
           if (type === "bool") payload[key] = node.dataset.value === "true";
-          else if (type === "int") payload[key] = Number.parseInt(node.value || "0", 10);
-          else if (type === "float") payload[key] = Number.parseFloat(node.value || "0");
+          else if (type === "json") payload[key] = node.value.trim() ? JSON.parse(node.value) : {};
+          else if (type === "int" || valueType === "int") payload[key] = Number.parseInt(node.value || "0", 10);
+          else if (type === "float" || valueType === "float") payload[key] = Number.parseFloat(node.value || "0");
           else payload[key] = node.value || "";
         });
+        if (schemaKind) payload.__web_schema_kind = schemaKind;
         const res = await ShinsekaiAPI.savePluginWebFile({ path: configSchema.path, content: JSON.stringify(payload, null, 2) });
         notify(res.message || "插件设置已保存");
         return;
@@ -1960,7 +2414,7 @@ function openSystemTemplateEditor() {
     ],
     onSave: async (payload) => {
       currentTemplateName = payload.filename || filename;
-      currentSystemTemplate = payload.system_template || "";
+      setCurrentSystemTemplate(payload.system_template || "");
       setField("会话名称", payload.session_name || templateDisplayName(currentTemplateName), $("#screen-sessions"));
       setField("用户情景", payload.scenario || "", $("#screen-sessions"));
       const res = await ShinsekaiAPI.saveTemplate({
@@ -1976,8 +2430,6 @@ function openSystemTemplateEditor() {
 }
 
 function wireDetailedSettingsPanels() {
-  $(".user-meta")?.addEventListener("click", openSystemConfigEditor);
-
   const services = $("#screen-services");
   $$(".detail-card", services).forEach((card) => {
     const title = textOf($(".char-name", card));
@@ -2044,12 +2496,18 @@ function wireMiscStateButtons() {
     const target = event.target;
     if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement)) return;
     if (target.closest("#screen-sessions")) {
-      if (target === findFieldControl("出场角色", $("#screen-sessions"))) selectedSessionCharacters = selectedCharactersFromInput();
+      if (target === findFieldControl("出场角色", $("#screen-sessions"))) {
+        setSelectedSessionCharacters(selectedCharactersFromInput());
+        markFreshSession("character");
+        return;
+      }
       if (target === findFieldControl("场景背景", $("#screen-sessions"))) {
         selectedBackgroundName = target.value;
         const bg = currentBackground();
         selectedBackgroundSpritePath = firstResourcePath(bg?.sprites);
         if (bg) hydrateBackgroundEditor(bg);
+        markFreshSession("background");
+        return;
       }
       refreshAllDerivedState();
     }
@@ -2059,7 +2517,7 @@ function wireMiscStateButtons() {
 function wireApiButtons() {
   const templateSelect = $("#screen-sessions aside .section-group select");
   templateSelect?.addEventListener("change", async () => {
-    try { await loadTemplateIntoSession(templateSelect.value, { silent: false, replaceMockOnly: false }); }
+    try { await loadTemplateIntoSession(templateSelect.value, { silent: false, replaceBlankOnly: false }); }
     catch (err) { notify(`加载模板失败：${err.message}`); }
   });
 
@@ -2095,6 +2553,7 @@ function wireApiButtons() {
     if (!payload.name) return notify("人物名称不能为空");
     try {
       const res = await ShinsekaiAPI.saveCharacter(payload.name, payload);
+      await hydrateFromBackend();
       notify(res?.message || "人物已保存");
     } catch (err) {
       notify(`人物保存失败：${err.message}`);
@@ -2106,6 +2565,7 @@ function wireApiButtons() {
     if (!payload.name) return notify("场景名称不能为空");
     try {
       const res = await ShinsekaiAPI.saveBackground(payload.name, payload);
+      await hydrateFromBackend();
       notify(res?.message || "场景已保存");
     } catch (err) {
       notify(`场景保存失败：${err.message}`);
@@ -2131,13 +2591,8 @@ function wireApiButtons() {
     try {
       const payload = collectSessionBuilder();
       const res = await ShinsekaiAPI.generateTemplate(payload);
-      currentSystemTemplate = res?.system_template || "";
-      const preview = $("#screen-sessions .detail-card.wide-card:last-child .detail-body .muted-line");
-      if (preview) {
-        preview.textContent = currentSystemTemplate
-          ? `模板已生成：${currentSystemTemplate.slice(0, 120)}...`
-          : (res?.message || "模板生成完成，但未返回系统模板。检查后端 context。 ");
-      }
+      setCurrentSystemTemplate(res?.system_template || "", sessionTemplateKey(payload));
+      renderTemplatePreview({ ...payload, system_template: currentSystemTemplate });
       notify(res?.message || "模板已生成");
     } catch (err) {
       notify(`生成模板失败：${err.message}`);
@@ -2151,7 +2606,7 @@ function wireApiButtons() {
         const payload = {
           ...session,
           user_scenario: session.scenario,
-          system_template: session.system_template || currentSystemTemplate || "",
+          system_template: systemTemplateForLaunch(session),
           selected_bg: session.bg_name || firstBackground()?.name || "TRANSPARENT",
           room_id: ""
         };
@@ -2178,11 +2633,12 @@ function wireApiButtons() {
     try {
       setField("历史文件路径", "", $("#screen-sessions"));
       const session = collectSessionBuilder();
+      const freshHistoryFile = buildFreshHistoryFilePath();
       const res = await ShinsekaiAPI.launch({
         ...session,
         user_scenario: session.scenario,
-        system_template: session.system_template || currentSystemTemplate || "",
-        history_file: "",
+        system_template: systemTemplateForLaunch(session),
+        history_file: freshHistoryFile,
         selected_bg: session.bg_name || firstBackground()?.name || "TRANSPARENT",
         room_id: ""
       });

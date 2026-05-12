@@ -19,6 +19,7 @@ import platform
 import subprocess
 import time
 import traceback
+import re
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,6 +30,26 @@ os.chdir(ROOT)
 os.environ.setdefault("EASYAI_PROJECT_ROOT", str(ROOT))
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+
+_i18n_ready = False
+
+
+def _ensure_i18n_initialized() -> None:
+    """Initialize runtime translations for the Web bridge before using shared services."""
+    global _i18n_ready
+    if _i18n_ready:
+        return
+    try:
+        from config.config_manager import ConfigManager
+        from i18n import init_i18n
+
+        init_i18n(ConfigManager().config.system_config.ui_language)
+    except Exception:
+        from i18n import init_i18n
+
+        init_i18n("zh_CN")
+    _i18n_ready = True
 
 
 def _json_safe(value: Any) -> Any:
@@ -42,6 +63,170 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
     return value
+
+
+def _plugin_manifest_path() -> Path:
+    return ROOT / "data" / "config" / "plugins.yaml"
+
+
+def _parse_yaml_scalar(value: str) -> Any:
+    raw = value.strip()
+    if not raw:
+        return ""
+    if raw.lower() in {"true", "false"}:
+        return raw.lower() == "true"
+    if raw.lower() in {"null", "none", "~"}:
+        return None
+    if (raw.startswith('"') and raw.endswith('"')) or (raw.startswith("'") and raw.endswith("'")):
+        try:
+            return json.loads(raw) if raw.startswith('"') else raw[1:-1].replace("''", "'")
+        except Exception:
+            return raw.strip("\"'")
+    return raw
+
+
+def _read_plugin_manifest_items_light(path: Path | None = None) -> list[dict[str, Any]]:
+    """Read plugins.yaml without importing PySide-heavy plugin_host."""
+    p = path if path is not None else _plugin_manifest_path()
+    if not p.is_file():
+        return []
+    text = p.read_text(encoding="utf-8")
+    try:
+        import yaml
+
+        raw = yaml.safe_load(text) or []
+        if not isinstance(raw, list):
+            return []
+        return [
+            dict(item)
+            for item in raw
+            if isinstance(item, dict) and isinstance(item.get("entry"), str) and item.get("entry").strip()
+        ]
+    except Exception:
+        pass
+
+    items: list[dict[str, Any]] = []
+    current: dict[str, Any] | None = None
+
+    def put_pair(target: dict[str, Any], chunk: str) -> None:
+        if ":" not in chunk:
+            return
+        key, value = chunk.split(":", 1)
+        key = key.strip()
+        if not key:
+            return
+        target[key] = _parse_yaml_scalar(value)
+
+    for raw_line in text.splitlines():
+        if not raw_line.strip() or raw_line.lstrip().startswith("#"):
+            continue
+        if raw_line.startswith("- "):
+            if current and isinstance(current.get("entry"), str) and current.get("entry").strip():
+                items.append(current)
+            current = {}
+            put_pair(current, raw_line[2:].strip())
+        elif current is not None and raw_line.startswith(("  ", "\t")):
+            put_pair(current, raw_line.strip())
+    if current and isinstance(current.get("entry"), str) and current.get("entry").strip():
+        items.append(current)
+    return items
+
+
+def _format_yaml_scalar(value: Any) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if value is None:
+        return "null"
+    if isinstance(value, (int, float)):
+        return str(value)
+    text = str(value)
+    if re.fullmatch(r"[A-Za-z0-9_./:@+-]+", text):
+        return text
+    return json.dumps(text, ensure_ascii=False)
+
+
+def _write_plugin_manifest_items_light(items: list[dict[str, Any]], path: Path | None = None) -> None:
+    p = path if path is not None else _plugin_manifest_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        import yaml
+
+        p.write_text(
+            yaml.safe_dump(items, allow_unicode=True, sort_keys=False, default_flow_style=False),
+            encoding="utf-8",
+        )
+        return
+    except Exception:
+        pass
+    lines: list[str] = []
+    for item in items:
+        entry = str(item.get("entry") or "").strip()
+        if not entry:
+            continue
+        lines.append(f"- entry: {_format_yaml_scalar(entry)}")
+        for key, value in item.items():
+            if key == "entry":
+                continue
+            lines.append(f"  {key}: {_format_yaml_scalar(value)}")
+    p.write_text("\n".join(lines) + ("\n" if lines else ""), encoding="utf-8")
+
+
+def _normalize_manifest_entry_light(entry: str) -> str:
+    norm = str(entry or "").strip()
+    if not norm:
+        return norm
+    if norm.startswith("plugins."):
+        return norm
+    return f"plugins.{norm}"
+
+
+def _infer_plugin_package_directory_light(entry: str) -> Path | None:
+    raw = str(entry or "").strip()
+    if not raw:
+        return None
+    mod = raw.split(":", 1)[0].strip()
+    if not mod.startswith("plugins."):
+        mod = _normalize_manifest_entry_light(mod)
+    rest = mod.removeprefix("plugins.")
+    top = rest.split(".", 1)[0].strip()
+    return Path("plugins") / top if top else None
+
+
+def _append_plugin_manifest_entry_if_missing_light(entry: str, *, enabled: bool = True) -> str:
+    norm = _normalize_manifest_entry_light(entry)
+    if not norm:
+        return "empty"
+    items = _read_plugin_manifest_items_light()
+    for item in items:
+        if str(item.get("entry") or "").strip() == norm:
+            return "exists"
+    items.append({"entry": norm, "enabled": bool(enabled)})
+    _write_plugin_manifest_items_light(items)
+    return "added"
+
+
+def _set_plugin_manifest_enabled_light(entry: str, enabled: bool) -> bool:
+    norm = str(entry or "").strip()
+    items = _read_plugin_manifest_items_light()
+    changed = False
+    for item in items:
+        if str(item.get("entry") or "").strip() == norm:
+            item["enabled"] = bool(enabled)
+            changed = True
+            break
+    if changed:
+        _write_plugin_manifest_items_light(items)
+    return changed
+
+
+def _remove_plugin_manifest_entry_light(entry: str) -> bool:
+    norm = str(entry or "").strip()
+    items = _read_plugin_manifest_items_light()
+    kept = [item for item in items if str(item.get("entry") or "").strip() != norm]
+    if len(kept) == len(items):
+        return False
+    _write_plugin_manifest_items_light(kept)
+    return True
 
 
 
@@ -94,6 +279,20 @@ def _provider_map_value(mapping: Any, provider: str, default: str = "") -> str:
         if v not in (None, ""):
             return str(v)
     return default
+
+
+def _normalize_extra_config_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(k): _normalize_extra_config_value(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_normalize_extra_config_value(v) for v in value]
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"true", "yes", "on", "1", "是", "启用", "enabled"}:
+            return True
+        if lowered in {"false", "no", "off", "0", "否", "关闭", "disabled"}:
+            return False
+    return value
 
 
 def _llm_provider_rows() -> list[dict[str, Any]]:
@@ -172,6 +371,7 @@ def _repair_legacy_llm_provider_config() -> None:
 
 def _ctx():
     """Create SettingsUIContext lazily so the server can start from repo root."""
+    _ensure_i18n_initialized()
     from config.config_manager import ConfigManager
 
     cm = ConfigManager()
@@ -249,12 +449,16 @@ def _static_plugin_metadata(package_dir: Path | None) -> dict[str, Any]:
     the same human-facing names as the native settings/tools tabs.
     """
     out: dict[str, Any] = {
+        "plugin_id": "",
+        "plugin_version": "",
         "plugin_name": "",
         "plugin_description": "",
         "plugin_author": "",
         "settings_labels": [],
         "tools_titles": [],
         "labels": [],
+        "settings_count": 0,
+        "tools_count": 0,
     }
     if package_dir is None or not package_dir.exists():
         return out
@@ -278,6 +482,10 @@ def _static_plugin_metadata(package_dir: Path | None) -> dict[str, Any]:
         if isinstance(node, ast.Call):
             name = call_name(node.func)
             if name in {"SettingsUIContribution", "ToolsTabContribution"}:
+                if name == "SettingsUIContribution":
+                    out["settings_count"] += 1
+                else:
+                    out["tools_count"] += 1
                 for kw in node.keywords:
                     key = str(kw.arg or "")
                     val = _const_str_from_ast(kw.value)
@@ -290,10 +498,13 @@ def _static_plugin_metadata(package_dir: Path | None) -> dict[str, Any]:
                         out["tools_titles"].append(val)
                         out["labels"].append(val)
         elif isinstance(node, ast.ClassDef):
+            doc = ast.get_docstring(node)
+            if doc and not out["plugin_description"]:
+                out["plugin_description"] = doc.strip()
             for item in node.body:
                 if not isinstance(item, ast.FunctionDef):
                     continue
-                if item.name not in {"plugin_name", "plugin_description", "plugin_author"}:
+                if item.name not in {"plugin_id", "plugin_version", "plugin_name", "plugin_description", "plugin_author"}:
                     continue
                 is_property = any(
                     isinstance(d, ast.Name) and d.id == "property"
@@ -360,6 +571,8 @@ def _pick_plugin_display_name(
         candidates.append(plugin_name)
     if plugin_name:
         candidates.append(plugin_name)
+    if default_tail_name:
+        candidates.append(default_tail_name)
     candidates.extend([plugin_id, entry_tail])
 
     for c in candidates:
@@ -451,6 +664,11 @@ def _plugin_rows() -> list[dict[str, Any]]:
             package_dir = infer_plugin_package_directory(entry)
             package_abs = (ROOT / package_dir) if package_dir is not None else None
             static_meta = _static_plugin_metadata(package_abs)
+            effective_plugin_id = plugin_id or str(static_meta.get("plugin_id") or "").strip()
+            effective_plugin_version = plugin_version or str(static_meta.get("plugin_version") or "").strip()
+            effective_plugin_name = plugin_name or str(static_meta.get("plugin_name") or "").strip()
+            effective_plugin_description = plugin_description or str(static_meta.get("plugin_description") or "").strip()
+            effective_plugin_author = plugin_author or str(static_meta.get("plugin_author") or "").strip()
             entry_tail = entry.rpartition(":")[2] or entry.rpartition(".")[2] or entry
 
             settings_meta = [
@@ -461,7 +679,7 @@ def _plugin_rows() -> list[dict[str, Any]]:
                     "plugin_version": str(getattr(c, "plugin_version", "") or ""),
                 }
                 for c in settings
-                if not plugin_id or str(getattr(c, "plugin_id", "") or "") == plugin_id
+                if effective_plugin_id and str(getattr(c, "plugin_id", "") or "") == effective_plugin_id
             ]
             tools_meta = [
                 {
@@ -471,7 +689,7 @@ def _plugin_rows() -> list[dict[str, Any]]:
                     "plugin_version": str(getattr(c, "plugin_version", "") or ""),
                 }
                 for c in tools
-                if not plugin_id or str(getattr(c, "plugin_id", "") or "") == plugin_id
+                if effective_plugin_id and str(getattr(c, "plugin_id", "") or "") == effective_plugin_id
             ]
 
             contribution_label = ""
@@ -487,12 +705,12 @@ def _plugin_rows() -> list[dict[str, Any]]:
 
             if not settings_meta:
                 settings_meta = [
-                    {"page_id": "", "nav_label": label, "plugin_id": plugin_id, "plugin_version": plugin_version, "source": "static"}
+                    {"page_id": "", "nav_label": label, "plugin_id": effective_plugin_id, "plugin_version": effective_plugin_version, "source": "static"}
                     for label in static_meta.get("settings_labels") or []
                 ]
             if not tools_meta:
                 tools_meta = [
-                    {"tab_id": "", "title": title, "plugin_id": plugin_id, "plugin_version": plugin_version, "source": "static"}
+                    {"tab_id": "", "title": title, "plugin_id": effective_plugin_id, "plugin_version": effective_plugin_version, "source": "static"}
                     for title in static_meta.get("tools_titles") or []
                 ]
             if not contribution_label:
@@ -507,8 +725,8 @@ def _plugin_rows() -> list[dict[str, Any]]:
             display_name = _pick_plugin_display_name(
                 item=item,
                 plugin=plugin,
-                plugin_id=plugin_id,
-                plugin_name=plugin_name,
+                plugin_id=effective_plugin_id,
+                plugin_name=effective_plugin_name,
                 contribution_label=contribution_label,
                 static_meta=static_meta,
                 entry_tail=entry_tail,
@@ -519,11 +737,11 @@ def _plugin_rows() -> list[dict[str, Any]]:
                 "entry": entry,
                 "enabled": enabled,
                 "display_name": display_name,
-                "plugin_name": plugin_name,
-                "plugin_description": plugin_description,
-                "plugin_author": plugin_author,
-                "plugin_id": plugin_id,
-                "plugin_version": plugin_version,
+                "plugin_name": effective_plugin_name,
+                "plugin_description": effective_plugin_description,
+                "plugin_author": effective_plugin_author,
+                "plugin_id": effective_plugin_id,
+                "plugin_version": effective_plugin_version,
                 "loaded": plugin is not None,
                 "package_dir": str(package_dir) if package_dir is not None else "",
                 "package_exists": bool(package_dir and (ROOT / package_dir).exists()),
@@ -531,8 +749,8 @@ def _plugin_rows() -> list[dict[str, Any]]:
                 "tools_contributions": tools_meta,
                 "static_plugin_labels": static_meta.get("labels") or [],
                 "static_plugin_name": static_meta.get("plugin_name") or "",
-                "has_settings": bool(settings_meta),
-                "has_tools": bool(tools_meta),
+                "has_settings": bool(settings_meta or static_meta.get("settings_count")),
+                "has_tools": bool(tools_meta or static_meta.get("tools_count")),
             })
         return rows
     except Exception:
@@ -551,6 +769,101 @@ def _plugin_rows() -> list[dict[str, Any]]:
             for x in _plugins_manifest()
             if isinstance(x, dict)
         ]
+
+
+def _plugin_catalog_rows() -> dict[str, Any]:
+    """Fetch the remote plugin catalog and annotate it with local install state."""
+    from core.plugins.registry_catalog import (
+        DEFAULT_REGISTRY_JSON_URL,
+        fetch_registry_error_message,
+        fetch_registry_plugins,
+    )
+    from core.plugins.registry_download import load_downloaded_repos, normalize_repo_slug
+
+    try:
+        records = fetch_registry_plugins(DEFAULT_REGISTRY_JSON_URL)
+    except Exception as exc:
+        return {
+            "catalog": [],
+            "error": fetch_registry_error_message(exc),
+            "registry_url": DEFAULT_REGISTRY_JSON_URL,
+        }
+
+    local_plugins = _plugin_rows()
+    local_by_entry = {
+        _normalize_manifest_entry_light(str(row.get("entry") or "")): row
+        for row in local_plugins
+        if str(row.get("entry") or "").strip()
+    }
+    downloaded = load_downloaded_repos()
+    rows: list[dict[str, Any]] = []
+    for rec in records:
+        repo_norm = normalize_repo_slug(rec.repo) if rec.repo.strip() else ""
+        entry_norm = _normalize_manifest_entry_light(rec.entry) if rec.entry.strip() else ""
+        local = local_by_entry.get(entry_norm)
+        is_downloaded = bool(repo_norm and repo_norm in downloaded)
+        is_installed = local is not None
+        rows.append({
+            "name": rec.name,
+            "author": rec.author,
+            "repo": rec.repo,
+            "repo_norm": repo_norm,
+            "description": rec.description,
+            "entry": entry_norm,
+            "github_url": rec.github_url() if rec.repo.strip() else "",
+            "downloaded": is_downloaded,
+            "installed": is_installed,
+            "enabled": local.get("enabled") if local else None,
+            "loaded": local.get("loaded") if local else False,
+            "local_display_name": local.get("display_name") if local else "",
+            "action_label": "更新" if is_downloaded or is_installed else "安装",
+            "status_label": "已安装" if is_installed else ("已下载" if is_downloaded else "可安装"),
+        })
+    return {
+        "catalog": rows,
+        "error": "",
+        "registry_url": DEFAULT_REGISTRY_JSON_URL,
+    }
+
+
+def _install_catalog_plugin(payload: dict[str, Any]) -> dict[str, Any]:
+    """Download a registry plugin, install its requirements, and add it to plugins.yaml."""
+    from core.plugins.github_bundle_update import install_github_plugin_under_plugins
+    from core.plugins.plugin_requirements_install import install_plugin_requirements_txt
+    from core.plugins.registry_download import mark_repo_downloaded, normalize_repo_slug
+
+    repo = str(payload.get("repo") or "").strip()
+    if not repo or repo.count("/") < 1:
+        raise ValueError("缺少有效 GitHub 仓库（owner/repo）")
+    name = str(payload.get("name") or "").strip() or repo.rpartition("/")[2]
+    entry = _normalize_manifest_entry_light(str(payload.get("entry") or "").strip())
+    overwrite = bool(payload.get("overwrite", False))
+
+    dest = install_github_plugin_under_plugins(
+        repo,
+        catalog_display_name=name,
+        ref_kind="latest",
+        tag_name="",
+        overwrite=overwrite,
+        plugins_parent=ROOT / "plugins",
+    )
+    pip_code, pip_detail = install_plugin_requirements_txt(dest)
+    if pip_code in {"pip_failed", "pip_timeout", "pip_exception"}:
+        raise RuntimeError(f"插件依赖安装失败：{pip_code}{': ' + pip_detail if pip_detail else ''}")
+
+    manifest_outcome = "skipped"
+    if entry:
+        manifest_outcome = _append_plugin_manifest_entry_if_missing_light(entry, enabled=True)
+    mark_repo_downloaded(normalize_repo_slug(repo), manifest_entry=entry or None)
+    return {
+        "ok": True,
+        "message": "插件已下载并写入清单，重启应用后完全生效",
+        "plugin_dir": _path_relative_to_root(dest),
+        "pip": pip_code,
+        "manifest": manifest_outcome,
+        "plugins": _plugin_rows(),
+        **_plugin_catalog_rows(),
+    }
 
 
 
@@ -587,7 +900,11 @@ def _safe_plugin_text_file(raw_path: str) -> Path | None:
     except OSError:
         return None
     allowed_roots = [ROOT / "plugins", ROOT / "data" / "plugins", ROOT / "data" / "config" / "plugins.yaml"]
-    if resolved == (ROOT / "data" / "config" / "plugins.yaml").resolve():
+    allowed_files = {
+        (ROOT / "data" / "config" / "plugins.yaml").resolve(),
+        (ROOT / "data" / "chat_ui_theme.json").resolve(),
+    }
+    if resolved in allowed_files:
         return resolved
     if not any(_is_inside(resolved, base) for base in allowed_roots[:2]):
         return None
@@ -808,12 +1125,201 @@ def _plugin_config_field_attr_name(field_name: str) -> str:
     return aliases.get(field_name, field_name)
 
 
+def _read_json_dict_utf8(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return {}
+    return dict(raw) if isinstance(raw, dict) else {}
+
+
+def _web_field(
+    name: str,
+    label: str,
+    typ: str,
+    default: Any,
+    *,
+    section: str = "",
+    choices: list[Any] | None = None,
+    labels: list[str] | None = None,
+    help_text: str = "",
+    placeholder: str = "",
+    ui: str = "",
+    min_value: int | float | None = None,
+    max_value: int | float | None = None,
+    step: int | float | None = None,
+    multiline: bool = False,
+) -> dict[str, Any]:
+    field: dict[str, Any] = {
+        "name": name,
+        "type": typ,
+        "default": default,
+        "label": label,
+    }
+    if section:
+        field["section"] = section
+    if choices is not None:
+        field["choices"] = choices
+    if labels is not None:
+        field["labels"] = labels
+    if help_text:
+        field["help"] = help_text
+    if placeholder:
+        field["placeholder"] = placeholder
+    if ui:
+        field["ui"] = ui
+    if min_value is not None:
+        field["min"] = min_value
+    if max_value is not None:
+        field["max"] = max_value
+    if step is not None:
+        field["step"] = step
+    if multiline:
+        field["multiline"] = True
+    return field
+
+
+def _plugin_web_schema_for_minimax_tts(package_dir: Path, preferred_data_dir: Path) -> dict[str, Any]:
+    defaults = {
+        "model": "speech-2.8-hd",
+        "default_voice_id": "",
+        "language_boost": "auto",
+        "audio_format": "wav",
+        "sample_rate": 32000,
+        "bitrate": 128000,
+        "channel": 1,
+        "speed": 1.0,
+        "vol": 1.0,
+        "pitch": 0,
+        "emotion": "",
+        "auto_clone_from_reference": False,
+        "paragraph_split_enabled": True,
+        "request_timeout": 120,
+        "need_noise_reduction": False,
+        "need_volume_normalization": True,
+        "voice_cache_path": "cache/audio/minimax_voice_cache.json",
+        "voice_id_map": {},
+        "voice_id_versions": {},
+    }
+    defaults.update(_read_json_dict_utf8(package_dir / "config.json"))
+    cfg_path = preferred_data_dir / "config.json"
+    values = dict(defaults)
+    try:
+        from plugins.minimax_tts import state as minimax_state
+
+        loaded = minimax_state.load_plugin_config(preferred_data_dir)
+        if isinstance(loaded, dict):
+            values.update({k: v for k, v in loaded.items() if v not in (None, "", {}, [])})
+    except Exception:
+        values.update(_read_json_dict_utf8(cfg_path))
+
+    return {
+        "class_name": "MinimaxTtsSettingsWidget",
+        "kind": "minimax_tts",
+        "title": "MiniMax TTS",
+        "intro": [
+            "本面板按 plugins/minimax_tts/settings.py 的真实设置页生成；API Key 和 Base URL 仍在主菜单 API 页保存。",
+            "这里保存模型、合成参数、Paragraph、默认 voice_id 和角色 voice_id 绑定。上传参考音频仍需使用原生面板。",
+        ],
+        "path": _path_relative_to_root(cfg_path),
+        "exists": cfg_path.is_file(),
+        "format": "json",
+        "fields": [
+            _web_field("model", "模型", "str", defaults["model"], section="模型与兜底声线", choices=[
+                "speech-2.8-hd", "speech-2.8-turbo", "speech-2.6-hd",
+                "speech-2.6-turbo", "speech-02-hd", "speech-02-turbo",
+            ]),
+            _web_field("default_voice_id", "无角色兜底 voice_id", "str", "", section="模型与兜底声线", placeholder="未匹配角色时使用的保底 voice_id"),
+            _web_field("language_boost", "语言增强", "str", "auto", section="合成参数", choices=["auto", "Japanese", "Chinese", "Chinese,Yue", "English"]),
+            _web_field("audio_format", "音频格式", "str", "wav", section="合成参数", choices=["wav", "mp3", "flac"]),
+            _web_field("sample_rate", "采样率", "int", 32000, section="合成参数", min_value=8000, max_value=48000, step=1000),
+            _web_field("bitrate", "比特率", "int", 128000, section="合成参数", min_value=32000, max_value=320000, step=16000),
+            _web_field("channel", "声道", "int", 1, section="合成参数", choices=[1, 2], labels=["单声道", "双声道"]),
+            _web_field("speed", "语速", "float", 1.0, section="合成参数", min_value=0.5, max_value=2.0, step=0.05),
+            _web_field("vol", "音量", "float", 1.0, section="合成参数", min_value=0.1, max_value=10.0, step=0.05),
+            _web_field("pitch", "音高", "int", 0, section="合成参数", min_value=-12, max_value=12, step=1),
+            _web_field("emotion", "默认情绪", "str", "", section="合成参数", choices=["", "happy", "sad", "angry", "fearful", "disgusted", "surprised", "neutral"], labels=["不固定", "happy", "sad", "angry", "fearful", "disgusted", "surprised", "neutral"]),
+            _web_field("auto_clone_from_reference", "未找到 voice_id 时，从角色参考音频自动克隆", "bool", False, section="合成参数"),
+            _web_field("paragraph_split_enabled", "Paragraph：按段落整段生成（不按标点切分）", "bool", True, section="合成参数"),
+            _web_field("request_timeout", "请求超时", "int", 120, section="合成参数", min_value=5, max_value=600, step=1),
+            _web_field("need_noise_reduction", "克隆时启用降噪", "bool", False, section="角色参考音频上传"),
+            _web_field("need_volume_normalization", "克隆时音量归一", "bool", True, section="角色参考音频上传"),
+            _web_field("voice_cache_path", "自动克隆缓存", "str", defaults["voice_cache_path"], section="角色参考音频上传"),
+            _web_field("voice_id_map", "角色 voice_id 映射", "json", {}, section="角色 voice_id", ui="textarea", multiline=True, help_text='JSON 对象，例如 {"角色名": "voice_id"}。'),
+            _web_field("voice_id_versions", "voice_id 版本记录", "json", {}, section="角色 voice_id", ui="textarea", multiline=True, help_text="原生面板上传/导入产生的版本记录；通常无需手动改。"),
+        ],
+        "values": values,
+    }
+
+
+def _plugin_web_schema_for_chat_ui_theme(package_dir: Path) -> dict[str, Any]:
+    _ = package_dir
+    cfg_path = ROOT / "data" / "chat_ui_theme.json"
+    values = {
+        "primary": "#fffcf8",
+        "text": "#5e5e5e",
+        "border": "#ffd0c2",
+        "accent": "#ffbda8",
+        "radius": 16,
+        "panel_alpha": 0.92,
+        "pattern_path": "",
+        "pattern_opacity": 1.0,
+        "pattern_dialog": False,
+        "pattern_input": False,
+        "pattern_options": False,
+        "pattern_numeric": False,
+    }
+    return {
+        "class_name": "build_chat_ui_theme_settings",
+        "kind": "chat_ui_theme_builder",
+        "title": "聊天外观",
+        "intro": [
+            "本面板按 plugins/chat_ui_customize/settings_widget.py 的真实设置页生成，用调色板、圆角和可选印花生成 data/chat_ui_theme.json。",
+            "保存会重新生成正式主题 JSON；复杂的实时预览和本地图片选择仍可回原生面板使用。",
+        ],
+        "path": _path_relative_to_root(cfg_path),
+        "exists": cfg_path.is_file(),
+        "format": "json",
+        "fields": [
+            _web_field("primary", "主色（面板浅底）", "color", values["primary"], section="可视化配色", ui="color"),
+            _web_field("text", "主文字色", "color", values["text"], section="可视化配色", ui="color"),
+            _web_field("border", "边框色", "color", values["border"], section="可视化配色", ui="color"),
+            _web_field("accent", "强调色（发送键、Busy、录音激活等）", "color", values["accent"], section="可视化配色", ui="color"),
+            _web_field("radius", "圆角（px）", "int", values["radius"], section="圆角与面板不透明度", min_value=8, max_value=28, step=1),
+            _web_field("panel_alpha", "面板不透明度", "float", values["panel_alpha"], section="圆角与面板不透明度", min_value=0.5, max_value=0.98, step=0.01),
+            _web_field("pattern_path", "印花图片路径", "str", "", section="印花 / 纹理背景", placeholder="可选；绝对路径或项目内相对路径"),
+            _web_field("pattern_opacity", "印花透明度", "float", values["pattern_opacity"], section="印花 / 纹理背景", min_value=0.0, max_value=1.0, step=0.05),
+            _web_field("pattern_dialog", "叠加到对白气泡", "bool", False, section="印花 / 纹理背景"),
+            _web_field("pattern_input", "叠加到输入框", "bool", False, section="印花 / 纹理背景"),
+            _web_field("pattern_options", "叠加到选项区外框", "bool", False, section="印花 / 纹理背景"),
+            _web_field("pattern_numeric", "叠加到数值标签", "bool", False, section="印花 / 纹理背景"),
+        ],
+        "values": values,
+    }
+
+
+def _known_plugin_web_config_schema(package_dir: Path | None, preferred_data_dir: Path) -> dict[str, Any] | None:
+    if package_dir is None or not package_dir.exists():
+        return None
+    name = package_dir.name
+    if name == "minimax_tts":
+        return _plugin_web_schema_for_minimax_tts(package_dir, preferred_data_dir)
+    if name == "chat_ui_customize":
+        return _plugin_web_schema_for_chat_ui_theme(package_dir)
+    return None
+
+
 def _plugin_web_config_schema(package_dir: Path | None, preferred_data_dir: Path) -> dict[str, Any] | None:
     """Generate the Web version of the plugin's own settings panel.
 
     Reads config_model.py for fields/defaults and settings_tab.py for Chinese labels,
     help text, placeholders and the plugin's own introductory copy.
     """
+    special = _known_plugin_web_config_schema(package_dir, preferred_data_dir)
+    if special is not None:
+        return special
     if package_dir is None or not package_dir.exists():
         return None
     cfg_py = package_dir / "config_model.py"
@@ -1033,6 +1539,138 @@ def _plugin_web_detail(entry: str) -> dict[str, Any]:
             "note": "已优先使用 Web 插件窗口读取插件包与配置文件；PySide QWidget 设置页仅作为可选 fallback。",
         },
     }
+
+
+def _hex_color(value: Any, fallback: str) -> str:
+    text = str(value or "").strip()
+    if re.fullmatch(r"#[0-9A-Fa-f]{6}", text):
+        return text
+    return fallback
+
+
+def _as_web_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, str):
+        lowered = value.strip().lower()
+        if lowered in {"1", "true", "yes", "on", "是", "启用"}:
+            return True
+        if lowered in {"0", "false", "no", "off", "否", "关闭"}:
+            return False
+    return bool(value)
+
+
+def _as_web_float(value: Any, default: float, *, min_value: float | None = None, max_value: float | None = None) -> float:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        out = default
+    if min_value is not None:
+        out = max(min_value, out)
+    if max_value is not None:
+        out = min(max_value, out)
+    return out
+
+
+def _as_web_int(value: Any, default: int, *, min_value: int | None = None, max_value: int | None = None) -> int:
+    try:
+        out = int(value)
+    except (TypeError, ValueError):
+        out = default
+    if min_value is not None:
+        out = max(min_value, out)
+    if max_value is not None:
+        out = min(max_value, out)
+    return out
+
+
+def _save_chat_ui_theme_builder_config(values: dict[str, Any]) -> dict[str, Any]:
+    from PySide6.QtGui import QColor
+
+    from plugins.chat_ui_customize.theme_builder import build_theme_dict
+    from ui.chat_ui.theme_chrome import clear_chat_chrome_theme_cache
+
+    def color(key: str, fallback: str) -> QColor:
+        c = QColor(_hex_color(values.get(key), fallback))
+        if not c.isValid():
+            c = QColor(fallback)
+        return c
+
+    pattern_value = str(values.get("pattern_path") or "").strip()
+    pattern_path: Path | None = None
+    if pattern_value:
+        p = Path(pattern_value)
+        if not p.is_absolute():
+            p = ROOT / p
+        pattern_path = p
+
+    data = build_theme_dict(
+        primary=color("primary", "#fffcf8"),
+        text=color("text", "#5e5e5e"),
+        border=color("border", "#ffd0c2"),
+        accent=color("accent", "#ffbda8"),
+        panel_alpha=_as_web_float(values.get("panel_alpha"), 0.92, min_value=0.5, max_value=0.98),
+        radius=_as_web_int(values.get("radius"), 16, min_value=8, max_value=28),
+        pattern_path=pattern_path,
+        pattern_opacity=_as_web_float(values.get("pattern_opacity"), 1.0, min_value=0.0, max_value=1.0),
+        pattern_dialog=_as_web_bool(values.get("pattern_dialog"), False),
+        pattern_input=_as_web_bool(values.get("pattern_input"), False),
+        pattern_options=_as_web_bool(values.get("pattern_options"), False),
+        pattern_numeric=_as_web_bool(values.get("pattern_numeric"), False),
+    )
+    target = ROOT / "data" / "chat_ui_theme.json"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    try:
+        clear_chat_chrome_theme_cache()
+    except Exception:
+        traceback.print_exc()
+    return {
+        "ok": True,
+        "message": f"聊天外观主题已重新生成：{_path_relative_to_root(target)}",
+        "file": _summarize_text_file(target, editable=True),
+    }
+
+
+def _save_minimax_tts_web_config(values: dict[str, Any]) -> dict[str, Any]:
+    from plugins.minimax_tts import state as minimax_state
+
+    root = ROOT / "data" / "plugins" / "com.shinsekai.minimax_tts"
+    cleaned = dict(values)
+    cleaned.pop("__web_schema_kind", None)
+    minimax_state.save_plugin_config(root, cleaned)
+    target = root / "config.json"
+    return {
+        "ok": True,
+        "message": f"MiniMax TTS 插件设置已保存：{_path_relative_to_root(target)}",
+        "file": _summarize_text_file(target, editable=True),
+    }
+
+
+def _maybe_save_plugin_web_config(target: Path, content: str) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(content)
+    except Exception:
+        return None
+    if not isinstance(raw, dict):
+        return None
+    kind = str(raw.get("__web_schema_kind") or "").strip()
+    if not kind:
+        return None
+    values = dict(raw)
+    values.pop("__web_schema_kind", None)
+    if kind == "chat_ui_theme_builder":
+        if target.resolve() != (ROOT / "data" / "chat_ui_theme.json").resolve():
+            raise ValueError("聊天外观只能保存到 data/chat_ui_theme.json")
+        return _save_chat_ui_theme_builder_config(values)
+    if kind == "minimax_tts":
+        expected = (ROOT / "data" / "plugins" / "com.shinsekai.minimax_tts" / "config.json").resolve()
+        if target.resolve() != expected:
+            raise ValueError("MiniMax TTS 只能保存到 data/plugins/com.shinsekai.minimax_tts/config.json")
+        return _save_minimax_tts_web_config(values)
+    return None
 
 def _read_mcp_config() -> dict[str, Any]:
     try:
@@ -1314,6 +1952,9 @@ class ShinsekaiApiHandler(BaseHTTPRequestHandler):
             if path == "/api/plugins":
                 return self._ok({"plugins": _plugin_rows()})
 
+            if path == "/api/plugins/catalog":
+                return self._ok(_plugin_catalog_rows())
+
             if path == "/api/plugins/web-detail":
                 qs = parse_qs(urlparse(self.path).query)
                 entry = qs.get("entry", [""])[0]
@@ -1357,7 +1998,10 @@ class ShinsekaiApiHandler(BaseHTTPRequestHandler):
                 content = str(body.get("content") or "")
                 target = _safe_plugin_text_file(raw_path)
                 if target is None:
-                    return self._error(400, "不允许编辑该文件；Web 插件窗口只允许编辑 plugins/ 与 data/plugins/ 下的文本配置文件", detail={"path": raw_path})
+                    return self._error(400, "不允许编辑该文件；Web 插件窗口只允许编辑插件包、data/plugins/、plugins.yaml 与受支持的插件数据文件", detail={"path": raw_path})
+                special = _maybe_save_plugin_web_config(target, content)
+                if special is not None:
+                    return self._ok(special)
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
                 return self._ok({"ok": True, "message": f"插件文件已保存：{_path_relative_to_root(target)}", "file": _summarize_text_file(target, editable=True)})
@@ -1469,6 +2113,12 @@ class ShinsekaiApiHandler(BaseHTTPRequestHandler):
                 if not changed:
                     return self._error(404, "未找到插件清单条目", detail={"entry": entry})
                 return self._ok({"ok": True, "message": "插件启用状态已保存，重启应用后完全生效", "plugins": _plugin_rows()})
+
+            if path == "/api/plugins/catalog/install":
+                try:
+                    return self._ok(_install_catalog_plugin(body))
+                except Exception as exc:
+                    return self._error(500, str(exc))
 
             if path == "/api/plugins/open-settings":
                 # 可选 fallback：Web 插件窗口优先读取插件包/配置文件；只有复杂 QWidget 设置页无法 Web 化时才打开原生窗口。
@@ -1897,6 +2547,17 @@ class ShinsekaiApiHandler(BaseHTTPRequestHandler):
         api_key = str(body.get("api_key") or _provider_map_value(api.llm_api_key, requested_llm_provider) or _provider_map_value(api.llm_api_key, llm_provider) or "")
         base_url = str(body.get("base_url") or body.get("llm_base_url") or api.llm_base_url)
         is_streaming = str(body.get("is_streaming") or ("是" if api.is_streaming else "否"))
+
+        llm_extra_configs = body.get("llm_extra_configs")
+        if isinstance(llm_extra_configs, dict):
+            for provider_key, extra in llm_extra_configs.items():
+                provider_norm = _normalize_llm_provider_name(provider_key)
+                if provider_norm in supported and isinstance(extra, dict):
+                    cm.set_adapter_extra_config(
+                        "llm",
+                        provider_norm,
+                        _normalize_extra_config_value(extra),
+                    )
 
         tts_provider = str(body.get("tts_provider") or api.tts_provider)
         sovits_url = str(body.get("sovits_url") or body.get("gpt_sovits_url") or api.gpt_sovits_url)

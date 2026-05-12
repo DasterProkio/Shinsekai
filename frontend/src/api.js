@@ -99,6 +99,7 @@ export const ShinsekaiAPI = {
   }),
 
   listPlugins: () => request("/api/plugins"),
+  listPluginCatalog: () => request("/api/plugins/catalog"),
   getPluginWebDetail: (entry) => request(`/api/plugins/web-detail?entry=${encodeURIComponent(entry || "")}`),
   savePluginWebFile: (payload) => request("/api/plugins/web-file", {
     method: "PUT",
@@ -107,6 +108,10 @@ export const ShinsekaiAPI = {
   togglePlugin: (entry, enabled) => request("/api/plugins/toggle", {
     method: "POST",
     body: { entry, enabled }
+  }),
+  installCatalogPlugin: (payload) => request("/api/plugins/catalog/install", {
+    method: "POST",
+    body: payload
   }),
   openPluginSettings: (entry) => request("/api/plugins/open-settings", {
     method: "POST",

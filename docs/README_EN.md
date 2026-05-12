@@ -123,6 +123,7 @@ Independent of the plugin system: you can wire external capabilities through YAM
 |------|------|
 | Chinese README | [README.md](https://github.com/RachelForster/Shinsekai/blob/main/README.md) |
 | GUI user guide (Chinese, non-technical) | [GUI_USER_GUIDE_zh-CN.md](GUI_USER_GUIDE_zh-CN.md) |
+| TTS backend runbook | [TTS_BACKEND_RUNBOOK.md](TTS_BACKEND_RUNBOOK.md) |
 | Plugin developer guide | [PLUGIN_DEVELOPER_GUIDE.md](PLUGIN_DEVELOPER_GUIDE.md) |
 | Repository | [github.com/RachelForster/Shinsekai](https://github.com/RachelForster/Shinsekai) |
 

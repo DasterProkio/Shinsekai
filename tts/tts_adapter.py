@@ -10,8 +10,94 @@ import wave
 import array
 from pathlib import Path
 import subprocess
+import shutil
+import sys
 import time
 from typing import Optional, Callable
+from urllib.parse import urlparse
+
+
+def _server_host_port(url: str, default_host: str = "127.0.0.1", default_port: int = 9880) -> tuple[str, int]:
+    try:
+        parsed = urlparse(url)
+        return parsed.hostname or default_host, parsed.port or default_port
+    except Exception:
+        return default_host, default_port
+
+
+def _default_crossover_bottle() -> str | None:
+    env_bottle = os.environ.get("CX_BOTTLE")
+    if env_bottle:
+        return env_bottle
+
+    bottle_root = Path.home() / "Library" / "Application Support" / "CrossOver" / "Bottles"
+    if not bottle_root.is_dir():
+        return None
+    for preferred in ("ste", "Shinsekai", "default"):
+        if (bottle_root / preferred).is_dir():
+            return preferred
+    for bottle in bottle_root.iterdir():
+        if bottle.is_dir() and not bottle.name.startswith("."):
+            return bottle.name
+    return None
+
+
+def _windows_runtime_prefix() -> list[str] | None:
+    crossover_wine = Path("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/CrossOver-Hosted Application/wine")
+    if crossover_wine.exists():
+        bottle = _default_crossover_bottle()
+        return [str(crossover_wine), "--bottle", bottle] if bottle else [str(crossover_wine)]
+
+    for exe_name in ("wine64", "wine"):
+        exe_path = shutil.which(exe_name)
+        if exe_path:
+            return [exe_path]
+
+    raw_crossover_wine = Path("/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/wine/x86_64-unix/wine")
+    if raw_crossover_wine.exists():
+        return [str(raw_crossover_wine)]
+    return None
+
+
+def _wrap_windows_exe_command(cmd: list[str]) -> list[str]:
+    """Run bundled Windows runtimes through Wine/CrossOver when launched from macOS/Linux."""
+    if sys.platform == "win32" or not cmd or not cmd[0].lower().endswith(".exe"):
+        return cmd
+
+    prefix = _windows_runtime_prefix()
+    return [*prefix, *cmd] if prefix else cmd
+
+
+def _to_windows_runtime_path(path: str | os.PathLike | None) -> str:
+    if path is None:
+        return ""
+    path_s = os.fspath(path)
+    if sys.platform == "win32" or not path_s:
+        return path_s
+
+    prefix = _windows_runtime_prefix()
+    if prefix:
+        try:
+            result = subprocess.run(
+                [*prefix, "winepath", "-w", path_s],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                return result.stdout.strip().splitlines()[-1]
+        except Exception:
+            pass
+
+    try:
+        resolved = Path(path_s).expanduser().resolve()
+        home = Path.home().resolve()
+        try:
+            return "Y:\\" + str(resolved.relative_to(home)).replace("/", "\\")
+        except ValueError:
+            return "Z:" + str(resolved).replace("/", "\\")
+    except Exception:
+        return path_s
 
 
 class GPTSoVitsAdapter(TTSAdapter):
@@ -351,13 +437,19 @@ class GenieTTSAdapter(TTSAdapter):
         Path(onnx_dir).mkdir(parents=True, exist_ok=True)
         cmd = [
             str(embedded_python_path),
-            str(converter_script),
-            "--pth", pth_model_path,
-            "--ckpt", ckpt_model_path,
-            "--out", onnx_dir
+            _to_windows_runtime_path(converter_script),
+            "--pth", _to_windows_runtime_path(pth_model_path),
+            "--ckpt", _to_windows_runtime_path(ckpt_model_path),
+            "--out", _to_windows_runtime_path(onnx_dir),
         ]
         print(f"Converting ONNX for '{character_name}' ...")
-        result = subprocess.run(cmd, cwd=str(work_path), capture_output=True, text=True, timeout=600)
+        result = subprocess.run(
+            _wrap_windows_exe_command(cmd),
+            cwd=str(work_path),
+            capture_output=True,
+            text=True,
+            timeout=600
+        )
         if result.returncode != 0:
             raise RuntimeError(
                 f"Convert failed (code={result.returncode}).\nstdout:\n{result.stdout}\nstderr:\n{result.stderr}"
@@ -443,23 +535,44 @@ class GenieTTSAdapter(TTSAdapter):
             print("Genie TTS work path is empty, cannot auto start server.")
             return
 
-        os_path = self.tts_work_path
-        if os_path.endswith(".py"):
-            os_path = str(Path(os_path).parent)
+        work_path = Path(self.tts_work_path)
+        if work_path.suffix.lower() == ".py":
+            work_path = work_path.parent
+        os_path = str(work_path)
 
-        embedded_python_path = os.path.join(os_path, "runtime", "python.exe")
-        start_script_path = os.path.join(os_path, "start.py")
+        embedded_python_path = work_path / "runtime" / "python.exe"
+        start_script_path = work_path / "start.py"
+        server_module_path = work_path / "runtime" / "Lib" / "site-packages" / "genie_tts" / "Server.py"
 
-        if not os.path.exists(embedded_python_path):
+        if not embedded_python_path.exists():
             print(f"Genie TTS runtime not found: {embedded_python_path}")
             return
-        if not os.path.exists(start_script_path):
-            print(f"Genie TTS start.py not found: {start_script_path}")
-            return
 
-        self._server_process = subprocess.Popen([embedded_python_path, start_script_path], cwd=os_path)
+        if start_script_path.exists():
+            cmd = [str(embedded_python_path), str(start_script_path)]
+        else:
+            if not server_module_path.exists():
+                print(f"Genie TTS server module not found: {server_module_path}")
+                return
+            host, port = _server_host_port(self.tts_server_url)
+            cmd = [
+                str(embedded_python_path),
+                "-c",
+                (
+                    "from genie_tts.Server import start_server; "
+                    f"start_server(host={host!r}, port={int(port)}, workers=1)"
+                ),
+            ]
+
+        env = os.environ.copy()
+        env.setdefault("PYTHONIOENCODING", "utf-8")
+        try:
+            self._server_process = subprocess.Popen(_wrap_windows_exe_command(cmd), cwd=os_path, env=env)
+        except OSError as e:
+            print(f"Genie TTS server start failed: {e}")
+            return
         print("Genie TTS server starting...")
-        for _ in range(20):
+        for _ in range(60):
             time.sleep(0.5)
             if self._is_server_alive():
                 print("Genie TTS server started successfully.")
@@ -468,6 +581,9 @@ class GenieTTSAdapter(TTSAdapter):
 
     def _is_server_alive(self):
         try:
+            response = requests.get(self.tts_server_url + "docs", timeout=1.5)
+            if response.status_code < 500:
+                return True
             response = requests.post(self.tts_server_url + "stop", timeout=1.5)
             return response.status_code in (200, 204, 405)
         except Exception:
@@ -482,7 +598,7 @@ class GenieTTSAdapter(TTSAdapter):
             encoded_character_name = self._encode_name(self.character_name)
             payload = {
                 "character_name": encoded_character_name,
-                "onnx_model_dir": self.onnx_model_dir,
+                "onnx_model_dir": _to_windows_runtime_path(self.onnx_model_dir),
                 "language": language
             }
             response = requests.post(self.tts_server_url + "load_character", json=payload, timeout=20)
@@ -529,7 +645,7 @@ class GenieTTSAdapter(TTSAdapter):
             try:
                 payload = {
                     "character_name": encoded_character_name,
-                    "audio_path": ref_audio_path,
+                    "audio_path": _to_windows_runtime_path(ref_audio_path),
                     "audio_text": audio_text,
                     "language": audio_lang
                 }

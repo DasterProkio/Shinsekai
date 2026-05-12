@@ -128,6 +128,7 @@ python webui_qt.py
 | 内容 | 链接 |
 |------|------|
 | **图形界面使用指南（新手）** | [docs/GUI_USER_GUIDE_zh-CN.md](docs/GUI_USER_GUIDE_zh-CN.md) |
+| TTS 后端排障 | [docs/TTS_BACKEND_RUNBOOK.md](docs/TTS_BACKEND_RUNBOOK.md) |
 | 英文说明 | [docs/README_EN.md](docs/README_EN.md) |
 | 插件开发者指南 | [docs/PLUGIN_DEVELOPER_GUIDE.md](docs/PLUGIN_DEVELOPER_GUIDE.md) |
 | 本仓库 | [github.com/RachelForster/Shinsekai](https://github.com/RachelForster/Shinsekai) |
